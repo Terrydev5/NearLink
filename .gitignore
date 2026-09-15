@@ -1,0 +1,75 @@
+# NearLink repository-wide ignore rules
+
+# System files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# Private or machine-specific configuration
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.cer
+*.mobileprovision
+*.provisionprofile
+**/GoogleService-Info.plist
+**/google-services.json
+
+# This source document also contains internal Goal instructions. Publish a
+# separately curated technical document under docs/ instead.
+NearLink技术文档和Goal相关指令.rtf
+
+# Apple / Xcode / Swift
+DerivedData/
+build/
+Build/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+.build/
+Carthage/Build/
+
+# CocoaPods: retain Podfile and Podfile.lock, not generated Pods.
+Pods/
+
+# Android / Gradle / Android Studio
+.gradle/
+**/build/
+.kotlin/
+local.properties
+.idea/
+*.iml
+captures/
+.cxx/
+
+# Windows / Visual Studio / .NET
+.vs/
+**/[Bb]in/
+**/[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+TestResults/
+x64/
+x86/
+ARM/
+ARM64/
+
+# Flutter, if it is later used for a platform client
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Node-based tooling, if introduced for tooling or a web companion
+node_modules/
+dist/
+out/
+coverage/
