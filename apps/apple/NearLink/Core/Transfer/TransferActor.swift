@@ -5,12 +5,11 @@ actor TransferActor {
     private let historyKey = "NearLink.transferHistory.v1"
 
     func prepare(fileURL: URL, mimeType: String? = nil) throws -> TransferSnapshot {
-        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-        let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        let digest = try FileHasher.sha256AndByteCount(of: fileURL)
         let descriptor = TransferDescriptor(
             fileName: fileURL.lastPathComponent,
-            fileSize: fileSize,
-            checksum: try FileHasher.sha256(of: fileURL),
+            fileSize: digest.byteCount,
+            checksum: digest.checksum,
             mimeType: mimeType,
             streamToken: try TransferToken.generate(),
             streamTokenExpiresAt: Date().addingTimeInterval(120)
@@ -50,6 +49,11 @@ actor TransferActor {
         snapshot.completedBytes = min(max(0, completedBytes), snapshot.descriptor.fileSize)
         transfers[transferID] = snapshot
         return snapshot
+    }
+
+    func remove(_ transferID: UUID) {
+        transfers.removeValue(forKey: transferID)
+        persistTerminalHistory()
     }
 
     func snapshot(for transferID: UUID) -> TransferSnapshot? { transfers[transferID] }

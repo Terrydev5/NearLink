@@ -4,16 +4,25 @@ import Security
 
 nonisolated enum FileHasher {
     nonisolated static func sha256(of fileURL: URL) throws -> String {
+        try sha256AndByteCount(of: fileURL).checksum
+    }
+
+    /// Derive the advertised size from the same bytes that will be transferred.
+    /// This avoids relying on metadata that can differ across security-scoped
+    /// and provider-backed URLs.
+    nonisolated static func sha256AndByteCount(of fileURL: URL) throws -> (checksum: String, byteCount: Int64) {
         let handle = try FileHandle(forReadingFrom: fileURL)
         defer { try? handle.close() }
 
         var digest = SHA256()
+        var byteCount: Int64 = 0
         while true {
             let data = try handle.read(upToCount: NearLinkProtocol.chunkSize) ?? Data()
             guard !data.isEmpty else { break }
             digest.update(data: data)
+            byteCount += Int64(data.count)
         }
-        return digest.finalize().map { String(format: "%02x", $0) }.joined()
+        return (digest.finalize().map { String(format: "%02x", $0) }.joined(), byteCount)
     }
 }
 

@@ -175,6 +175,7 @@ final class NearLinkAppModel: ObservableObject {
                 server = transferServer
                 let port = try await transferServer.start()
                 let offeredSnapshot = try await transferActor.setStreamPort(snapshot.id, port: port)
+                logger.info("Offering \(fileURL.lastPathComponent, privacy: .public) with \(offeredSnapshot.descriptor.fileSize, privacy: .public) bytes on data port \(port, privacy: .public)")
                 _ = try await transferActor.transition(snapshot.id, to: .waitingForAcceptance)
                 try await connection.send(NearLinkEnvelope(type: .fileOffer, payload: FileOfferPayload(transfer: offeredSnapshot.descriptor)))
                 outboundFileServers[snapshot.id] = transferServer
@@ -549,6 +550,53 @@ final class NearLinkAppModel: ObservableObject {
 
     func transferPeerID(for transferID: UUID) -> UUID? {
         transferPeerIDs[transferID]
+    }
+
+    /// Removes a single chat entry and its transfer record, but deliberately
+    /// leaves any already-saved file in the user's chosen system location.
+    func deleteConversationItem(_ itemID: UUID) {
+        guard let item = conversationItems.first(where: { $0.id == itemID }) else { return }
+        conversationItems.removeAll { $0.id == itemID }
+        persistConversationHistory()
+
+        guard case let .transfer(transferID) = item.kind else { return }
+        incomingOffers.removeValue(forKey: transferID)
+        transferPeerIDs.removeValue(forKey: transferID)
+        transferFileURLs.removeValue(forKey: transferID)
+        if let server = outboundFileServers.removeValue(forKey: transferID) {
+            Task { await server.stop() }
+        }
+        if let access = outboundFileAccess.removeValue(forKey: transferID), access.needsSecurityScope {
+            access.url.stopAccessingSecurityScopedResource()
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            await transferActor.remove(transferID)
+            transfers = await transferActor.allSnapshots()
+        }
+    }
+
+    func deleteTransferRecord(_ transferID: UUID) {
+        if let item = conversationItems.first(where: {
+            if case let .transfer(id) = $0.kind { return id == transferID }
+            return false
+        }) {
+            deleteConversationItem(item.id)
+            return
+        }
+        transferPeerIDs.removeValue(forKey: transferID)
+        transferFileURLs.removeValue(forKey: transferID)
+        if let server = outboundFileServers.removeValue(forKey: transferID) {
+            Task { await server.stop() }
+        }
+        if let access = outboundFileAccess.removeValue(forKey: transferID), access.needsSecurityScope {
+            access.url.stopAccessingSecurityScopedResource()
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            await transferActor.remove(transferID)
+            transfers = await transferActor.allSnapshots()
+        }
     }
 
     func conversationPreview(for peerID: UUID) -> ConversationPreview? {

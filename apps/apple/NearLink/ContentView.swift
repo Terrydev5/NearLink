@@ -331,7 +331,8 @@ private struct ConversationView: View {
                                         #endif
                                     },
                                     onAccept: { model.acceptIncomingTransfer(transfer.id) },
-                                    onReject: { model.rejectIncomingTransfer(transfer.id) }
+                                    onReject: { model.rejectIncomingTransfer(transfer.id) },
+                                    onDelete: { model.deleteTransferRecord(transfer.id) }
                                 )
                             }
                         }
@@ -441,6 +442,11 @@ private struct ConversationView: View {
         switch item.kind {
         case let .text(message):
             MessageBubble(message: message)
+                .contextMenu {
+                    Button("Delete", role: .destructive) {
+                        model.deleteConversationItem(item.id)
+                    }
+                }
         case let .transfer(transferID):
             if let transfer = model.transfers.first(where: { $0.id == transferID }) {
                 TransferCard(
@@ -462,7 +468,8 @@ private struct ConversationView: View {
                         #endif
                     },
                     onAccept: { model.acceptIncomingTransfer(transferID) },
-                    onReject: { model.rejectIncomingTransfer(transferID) }
+                    onReject: { model.rejectIncomingTransfer(transferID) },
+                    onDelete: { model.deleteConversationItem(item.id) }
                 )
             }
         }
@@ -607,6 +614,7 @@ private struct TransferCard: View {
     let onShowInFolder: () -> Void
     let onAccept: () -> Void
     let onReject: () -> Void
+    let onDelete: () -> Void
 
     var body: some View {
         Group {
@@ -620,8 +628,8 @@ private struct TransferCard: View {
                 cardContent
             }
         }
-        #if os(macOS)
         .contextMenu {
+            #if os(macOS)
             if transfer.state == .completed, localURL != nil {
                 Button("Open") {
                     onOpen()
@@ -630,8 +638,12 @@ private struct TransferCard: View {
                     onShowInFolder()
                 }
             }
+            Divider()
+            #endif
+            Button("Delete", role: .destructive) {
+                onDelete()
+            }
         }
-        #endif
     }
 
     private var cardContent: some View {

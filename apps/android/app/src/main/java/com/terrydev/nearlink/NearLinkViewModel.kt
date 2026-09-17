@@ -15,14 +15,19 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.DataInputStream
 import java.io.IOException
+import java.net.Inet6Address
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.security.MessageDigest
+import java.util.Collections
 import java.util.UUID
 
 private const val TAG = "NearLinkViewModel"
 private const val TRANSFER_TOKEN_TTL_MILLIS = 120_000L
+private const val DATA_CONNECTION_TIMEOUT_MILLIS = 10_000
 
 private fun persistentDeviceID(app: Application): UUID {
     val preferences = app.getSharedPreferences("nearlink", android.content.Context.MODE_PRIVATE)
@@ -271,8 +276,9 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
                 markConversationUnreadIfNeeded(peerID, incoming = true)
                 persistConversationHistory()
             }
-            incomingTransfers[transfer.id] = IncomingTransfer(transfer, remoteHost, sender)
-            Log.i(TAG, "Awaiting user approval for incoming ${transfer.fileName} (${transfer.id})")
+            val dataHost = incomingDataHost(peerID, remoteHost)
+            incomingTransfers[transfer.id] = IncomingTransfer(transfer, dataHost, sender)
+            Log.i(TAG, "Awaiting user approval for incoming ${transfer.fileName} (${transfer.id}), advertised size=${transfer.fileSize} bytes, data host=$dataHost")
         }
     }
 
@@ -306,11 +312,14 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         remoteHost: String,
         sendControl: suspend (String) -> Unit
     ) {
-        require(remoteHost.isNotBlank()) { "The sender address is unavailable" }
+        val dataHost = socketHost(remoteHost)
+        require(dataHost.isNotBlank()) { "The sender address is unavailable" }
         require(System.currentTimeMillis() <= transfer.streamTokenExpiresAt) {
             "The transfer authorization token has expired"
         }
-        Socket(normalizeHost(remoteHost), transfer.streamPort).use { socket ->
+        Log.i(TAG, "Connecting data stream for ${transfer.id}: $dataHost:${transfer.streamPort}, advertised size=${transfer.fileSize} bytes")
+        Socket().use { socket ->
+            socket.connect(InetSocketAddress(dataHost, transfer.streamPort), DATA_CONNECTION_TIMEOUT_MILLIS)
             socket.getOutputStream().apply {
                 write((transfer.streamToken + "\n").toByteArray(Charsets.US_ASCII))
                 flush()
@@ -375,6 +384,28 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun transferUri(transferID: UUID): Uri? = transfers[transferID]?.localUri
+
+    /** Removes the chat entry and transfer record, while retaining user-visible files. */
+    fun deleteConversationItem(itemID: UUID) {
+        viewModelScope.launch(Dispatchers.Main) {
+            val index = timeline.indexOfFirst { it.id == itemID }
+            if (index < 0) return@launch
+            val item = timeline.removeAt(index)
+            if (item is ConversationItem.Transfer) {
+                incomingTransfers.remove(item.transferID)?.let { incoming ->
+                    viewModelScope.launch(Dispatchers.IO) {
+                        runCatching { incoming.sender(Envelope.fileReject(item.transferID)) }
+                    }
+                }
+                synchronized(outgoingTransfers) { outgoingTransfers.remove(item.transferID) }
+                    ?.server
+                    ?.let { server -> runCatching { server.close() } }
+                transfers.remove(item.transferID)
+            }
+            persistConversationHistory()
+            Log.i(TAG, "Deleted conversation item $itemID")
+        }
+    }
 
     fun conversationPreview(peerID: UUID): ConversationPreview? {
         val item = timeline.lastOrNull { it.peerID == peerID } ?: return null
@@ -497,9 +528,56 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         return HelloDevice(id, device.optString("name").takeUnless { it.isBlank() })
     }
 
-    private fun normalizeHost(host: String): String {
-        return host.removePrefix("[").removeSuffix("]").substringBefore('%')
+    /**
+     * Ktor exposes an IPv6 link-local peer address without its interface scope.
+     * Bonjour resolution keeps that scope (for example `%wlan0`), which is
+     * mandatory when connecting a raw TCP socket to `fe80::`.
+     */
+    private fun incomingDataHost(peerID: UUID?, controlRemoteHost: String): String {
+        val resolvedHost = peerID
+            ?.let { id -> devices.firstOrNull { it.id == id }?.host }
+            ?.let(::socketHost)
+        val controlHost = socketHost(controlRemoteHost)
+        val scopedResolvedHost = resolvedHost?.takeIf { candidate ->
+            candidate.contains('%') &&
+                isIPv6LinkLocal(controlHost) &&
+                unscopedHost(candidate) == unscopedHost(controlHost)
+        }
+        val selectedHost = scopedResolvedHost
+            ?: resolvedHost?.takeIf { !isIPv6LinkLocal(controlHost) }
+            ?: controlHost
+        Log.d(TAG, "Resolved incoming data host: control=$controlRemoteHost, Bonjour=${resolvedHost ?: "unavailable"}, selected=$selectedHost")
+        return selectedHost
     }
+
+    private fun socketHost(host: String): String {
+        val cleanedHost = host.trim()
+            .removePrefix("[")
+            .removeSuffix("]")
+            .replace("%25", "%")
+        if (!isIPv6LinkLocal(cleanedHost) || cleanedHost.contains('%')) return cleanedHost
+
+        // The Bonjour host normally already includes its interface scope. This
+        // fallback covers Android/Ktor builds that expose only `fe80::address`.
+        val networkInterface = runCatching {
+            Collections.list(NetworkInterface.getNetworkInterfaces())
+                .asSequence()
+                .filter { it.isUp && !it.isLoopback }
+                .filter { network -> Collections.list(network.inetAddresses).any { it is Inet6Address && it.isLinkLocalAddress } }
+                .sortedByDescending { it.name.startsWith("wlan") }
+                .firstOrNull()
+        }.getOrNull()
+        return networkInterface?.let { "$cleanedHost%${it.name}" } ?: cleanedHost
+    }
+
+    private fun unscopedHost(host: String): String = host.trim()
+        .removePrefix("[")
+        .removeSuffix("]")
+        .replace("%25", "%")
+        .substringBefore('%')
+
+    private fun isIPv6LinkLocal(host: String): Boolean =
+        unscopedHost(host).lowercase().startsWith("fe80:")
 
     private fun acceptAuthorizedClient(outgoing: OutgoingTransfer): Socket {
         while (true) {

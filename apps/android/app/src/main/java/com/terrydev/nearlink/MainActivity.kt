@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -52,6 +53,7 @@ import androidx.compose.material.icons.filled.Photo
 import androidx.compose.material.icons.filled.PhoneIphone
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -161,8 +163,13 @@ private fun NearLinkScreen(
     openFile: (Uri, String?) -> Unit
 ) {
     var openedDevice by remember { mutableStateOf<NearbyDevice?>(null) }
+    val closeConversation = {
+        model.clearSelectedDevice()
+        openedDevice = null
+    }
 
-    if (openedDevice == null) {
+    val device = openedDevice
+    if (device == null) {
         NearbyHomeScreen(
             model = model,
             onDeviceSelected = { device ->
@@ -171,16 +178,16 @@ private fun NearLinkScreen(
             }
         )
     } else {
-            ConversationScreen(
-                model = model,
-                device = openedDevice!!,
-                chooseFile = chooseFile,
-                openFile = openFile,
-                onBack = {
-                    model.clearSelectedDevice()
-                    openedDevice = null
-                }
-            )
+        // The system Back button should return from a conversation to the
+        // nearby-device list, just like the navigation icon.
+        BackHandler(onBack = closeConversation)
+        ConversationScreen(
+            model = model,
+            device = device,
+            chooseFile = chooseFile,
+            openFile = openFile,
+            onBack = closeConversation
+        )
     }
 }
 
@@ -378,6 +385,7 @@ private fun ConversationScreen(
     val focusManager = LocalFocusManager.current
     val listState = rememberLazyListState()
     val timeline = model.timeline.filter { it.peerID == device.id }
+    var deleteTarget by remember { mutableStateOf<ConversationItem?>(null) }
 
     LaunchedEffect(timeline.size) {
         val lastIndex = listState.layoutInfo.totalItemsCount - 1
@@ -438,14 +446,22 @@ private fun ConversationScreen(
                 ) {
                     items(timeline, key = { it.id }) { item ->
                         when (item) {
-                            is ConversationItem.Message -> MessageBubble(item)
+                            is ConversationItem.Message -> MessageBubble(
+                                item,
+                                modifier = Modifier.pointerInput(item.id) {
+                                    detectTapGestures(onLongPress = { deleteTarget = item })
+                                }
+                            )
                             is ConversationItem.Transfer -> {
                                 model.transfers[item.transferID]?.let { transfer ->
                                     TransferCard(
                                         transfer = transfer,
                                         onOpen = { uri -> openFile(uri, transfer.mimeType) },
                                         onAccept = { model.acceptIncoming(transfer.id) },
-                                        onReject = { model.rejectIncoming(transfer.id) }
+                                        onReject = { model.rejectIncoming(transfer.id) },
+                                        modifier = Modifier.pointerInput(item.id) {
+                                            detectTapGestures(onLongPress = { deleteTarget = item })
+                                        }
                                     )
                                 }
                             }
@@ -454,6 +470,31 @@ private fun ConversationScreen(
                 }
             }
         }
+    }
+
+    deleteTarget?.let { item ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("Delete message?") },
+            text = {
+                Text(
+                    if (item is ConversationItem.Transfer) {
+                        "This removes the transfer from this conversation. Any file already saved to your device will be kept."
+                    } else {
+                        "This removes the message from this conversation."
+                    }
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    model.deleteConversationItem(item.id)
+                    deleteTarget = null
+                }) { Text("Delete") }
+            },
+            dismissButton = {
+                Button(onClick = { deleteTarget = null }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -472,11 +513,11 @@ private fun ConversationEmpty(deviceName: String) {
 }
 
 @Composable
-private fun MessageBubble(message: ConversationItem.Message) {
+private fun MessageBubble(message: ConversationItem.Message, modifier: Modifier = Modifier) {
     if (message.system) {
         Text(
             message.text,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = modifier.fillMaxWidth(),
             color = NearLinkSecondaryText,
             style = MaterialTheme.typography.bodySmall
         )
@@ -484,7 +525,7 @@ private fun MessageBubble(message: ConversationItem.Message) {
     }
 
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         horizontalArrangement = if (message.outgoing) Arrangement.End else Arrangement.Start
     ) {
         Surface(
@@ -507,10 +548,11 @@ private fun TransferCard(
     transfer: TransferItem,
     onOpen: (Uri) -> Unit,
     onAccept: () -> Unit,
-    onReject: () -> Unit
+    onReject: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     Card(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .then(
                 if (transfer.status == TransferStatus.COMPLETED && transfer.localUri != null) {
@@ -588,7 +630,9 @@ private fun transferStatusColor(transfer: TransferItem): Color = when (transfer.
 
 private fun formatBytes(bytes: Long): String {
     if (bytes < 1024) return "$bytes B"
-    val units = arrayOf("KB", "MB", "GB", "TB")
+    // Index zero must represent bytes. The previous array started at KB while
+    // the value was still in bytes, making every file appear 1024× larger.
+    val units = arrayOf("B", "KB", "MB", "GB", "TB")
     var value = bytes.toDouble()
     var unit = 0
     while (value >= 1024 && unit < units.lastIndex) {

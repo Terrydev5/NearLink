@@ -4,8 +4,11 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.util.Log
 import java.net.InetAddress
 import java.util.UUID
+
+private const val TAG = "NearbyDiscovery"
 
 class NearbyDiscovery(context: Context, private val localDevice: NearbyDevice) {
     private val nsd = context.getSystemService(NsdManager::class.java)
@@ -70,6 +73,7 @@ class NearbyDiscovery(context: Context, private val localDevice: NearbyDevice) {
                             onStatusChanged("Resolved ${serviceInfo.serviceName}, but no address was returned")
                             return
                         }
+                        Log.d(TAG, "Resolved ${serviceInfo.serviceName} to ${host.hostAddress} on port ${serviceInfo.port}")
                         devices[id] = NearbyDevice(
                             id = id,
                             name = serviceInfo.serviceName,
