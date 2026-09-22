@@ -8,6 +8,8 @@ nonisolated enum DevicePlatform: String, Codable, Sendable {
     case iOS
     case android
     case windows
+    /// Older local histories contain a peer ID without device metadata.
+    case unknown
 }
 
 nonisolated struct NearbyDevice: Identifiable, Codable, Hashable, Sendable {
@@ -50,6 +52,14 @@ nonisolated struct NearbyDevice: Identifiable, Codable, Hashable, Sendable {
         #else
         return NearbyDevice(id: deviceID, name: UIDevice.current.name, platform: .iOS)
         #endif
+    }
+
+    var historyProfile: NearbyDevice {
+        NearbyDevice(id: id, name: name, platform: platform, protocolVersion: protocolVersion)
+    }
+
+    static func historicalPlaceholder(id: UUID) -> NearbyDevice {
+        NearbyDevice(id: id, name: "Saved device \(id.uuidString.prefix(6))", platform: .unknown)
     }
 }
 

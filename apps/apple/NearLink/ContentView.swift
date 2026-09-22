@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Combine
+import OSLog
 import UniformTypeIdentifiers
 #if os(iOS)
 import AVFoundation
@@ -79,6 +80,7 @@ struct ContentView: View {
                     ForEach(model.devices) { device in
                         DeviceRow(
                             device: device,
+                            isOnline: model.isDeviceOnline(device.id),
                             preview: model.conversationPreview(for: device.id)
                         )
                             .contentShape(Rectangle())
@@ -114,6 +116,7 @@ struct ContentView: View {
                     ForEach(model.devices) { device in
                         DeviceRow(
                             device: device,
+                            isOnline: model.isDeviceOnline(device.id),
                             preview: model.conversationPreview(for: device.id)
                         )
                             .tag(device.id)
@@ -190,6 +193,7 @@ private struct LocalDeviceCard: View {
 
 private struct DeviceRow: View {
     let device: NearbyDevice
+    let isOnline: Bool
     let preview: ConversationPreview?
 
     var body: some View {
@@ -210,15 +214,14 @@ private struct DeviceRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 } else {
-                    Label("\(device.platform.displayName) · Available", systemImage: "circle.fill")
+                    Text(device.platform.displayName)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(.green, .secondary)
                 }
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 8) {
+                DeviceStatusBadge(isOnline: isOnline)
                 if let preview {
                     Text(preview.timestamp, format: .dateTime.hour().minute())
                         .font(.caption2)
@@ -247,9 +250,31 @@ private struct DeviceRow: View {
     }
 
     private var accessibilitySummary: String {
-        guard let preview else { return device.name + ", " + device.platform.displayName + ", available" }
+        let status = isOnline ? "online" : "offline"
+        guard let preview else { return device.name + ", " + device.platform.displayName + ", " + status }
         let unread = preview.unreadCount == 0 ? "" : ", \(preview.unreadCount) unread messages"
-        return device.name + ", " + preview.text + unread
+        return device.name + ", " + status + ", " + preview.text + unread
+    }
+}
+
+private struct DeviceStatusBadge: View {
+    let isOnline: Bool
+
+    private var color: Color { isOnline ? .green : .red }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(isOnline ? "Online" : "Offline")
+                .font(.caption2.weight(.semibold))
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(color.opacity(0.12), in: Capsule())
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(isOnline ? "Device online" : "Device offline")
     }
 }
 
@@ -281,9 +306,9 @@ private struct DetailEmptyState: View {
             Image(systemName: "bubble.left.and.bubble.right")
                 .font(.largeTitle)
                 .foregroundStyle(.blue)
-            Text("Choose a nearby device")
+            Text("Choose a device")
                 .font(.title3.weight(.semibold))
-            Text("Select a device to send messages or files.\n\(discoveryStatus)")
+            Text("Select a device to view its history or send messages and files when it is online.\n\(discoveryStatus)")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -299,8 +324,13 @@ private struct ConversationView: View {
     let chooseFile: () -> Void
     @FocusState private var isComposerFocused: Bool
     @State private var previewTransfer: TransferPreview?
+    private var isOnline: Bool { model.isDeviceOnline(device.id) }
     #if os(iOS)
     @State private var selectedPhoto: PhotosPickerItem?
+    @State private var isChoosingPhoto = false
+    @State private var isLoadingPhoto = false
+    @State private var photoImportError: String?
+    private let photoLogger = Logger(subsystem: "cn.terrydev.NearLink", category: "photo-import")
     #endif
 
     var body: some View {
@@ -309,7 +339,7 @@ private struct ConversationView: View {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     if peerConversationItems.isEmpty {
                         if peerTransfers.isEmpty {
-                            ConversationEmptyState(deviceName: device.name)
+                            ConversationEmptyState(deviceName: device.name, isOnline: isOnline)
                         } else {
                             ForEach(peerTransfers) { transfer in
                                 TransferCard(
@@ -370,24 +400,42 @@ private struct ConversationView: View {
             }
         }
         .safeAreaInset(edge: .bottom) {
-            #if os(iOS)
-            ComposerBar(
-                text: $model.messageText,
-                isFocused: $isComposerFocused,
-                canSend: model.selectedDeviceID != nil,
-                chooseFile: chooseFile,
-                send: model.sendMessage,
-                selectedPhoto: $selectedPhoto
-            )
-            #else
-            ComposerBar(
-                text: $model.messageText,
-                isFocused: $isComposerFocused,
-                canSend: model.selectedDeviceID != nil,
-                chooseFile: chooseFile,
-                send: model.sendMessage
-            )
-            #endif
+            VStack(spacing: 0) {
+                if !isOnline {
+                    Text("Device is offline. You can still view your conversation and saved files.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                        .padding(.vertical, 8)
+                }
+                #if os(iOS)
+                if isLoadingPhoto {
+                    ProgressView("Loading photo…")
+                        .padding(8)
+                }
+                ComposerBar(
+                    text: $model.messageText,
+                    isFocused: $isComposerFocused,
+                    canSend: isOnline,
+                    chooseFile: chooseFile,
+                    send: model.sendMessage,
+                    choosePhoto: {
+                        isComposerFocused = false
+                        photoLogger.notice("Choose Photo tapped; requesting photo picker")
+                        isChoosingPhoto = true
+                    }
+                )
+                #else
+                ComposerBar(
+                    text: $model.messageText,
+                    isFocused: $isComposerFocused,
+                    canSend: isOnline,
+                    chooseFile: chooseFile,
+                    send: model.sendMessage
+                )
+                #endif
+            }
         }
         .navigationTitle(device.name)
         #if os(iOS)
@@ -395,15 +443,7 @@ private struct ConversationView: View {
         #endif
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(.green)
-                        .frame(width: 8, height: 8)
-                    Text("Available")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .accessibilityLabel("Device available; connection starts when sending")
+                DeviceStatusBadge(isOnline: isOnline)
             }
         }
         #if os(iOS)
@@ -418,18 +458,25 @@ private struct ConversationView: View {
         #endif
         #if os(macOS)
         .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
+            guard isOnline, let url = urls.first else { return false }
             model.stageFile(url)
             return true
         }
         #endif
         #if os(iOS)
+        // Keep the presenter outside Menu: its content disappears after a choice.
+        .photosPicker(isPresented: $isChoosingPhoto, selection: $selectedPhoto, matching: .images)
         .task(id: selectedPhoto) {
-            guard let selectedPhoto,
-                  let data = try? await selectedPhoto.loadTransferable(type: Data.self) else { return }
-            let contentType = selectedPhoto.supportedContentTypes.first { $0.conforms(to: .image) }
-            model.stagePhotoData(data, contentType: contentType)
-            self.selectedPhoto = nil
+            guard let selectedPhoto else { return }
+            await importPhoto(selectedPhoto)
+        }
+        .alert("Could Not Load Photo", isPresented: Binding(
+            get: { photoImportError != nil },
+            set: { if !$0 { photoImportError = nil } }
+        )) {
+            Button("OK", role: .cancel) { photoImportError = nil }
+        } message: {
+            Text(photoImportError ?? "Please try selecting the photo again.")
         }
         .sheet(item: $previewTransfer) { preview in
             TransferPreviewSheet(url: preview.url)
@@ -437,12 +484,46 @@ private struct ConversationView: View {
         #endif
     }
 
+    #if os(iOS)
+    @MainActor
+    private func importPhoto(_ item: PhotosPickerItem) async {
+        guard !Task.isCancelled else { return }
+        isLoadingPhoto = true
+        photoLogger.notice("Photo selected; loading image data")
+        defer {
+            // A cancelled load must not clear a newer selection or its progress.
+            if selectedPhoto == item {
+                isLoadingPhoto = false
+                selectedPhoto = nil
+            }
+        }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self), !data.isEmpty else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            try Task.checkCancellation()
+            let contentType = item.supportedContentTypes.first { $0.conforms(to: .image) }
+            photoLogger.notice("Loaded photo data: \(data.count, privacy: .public) bytes")
+            model.stagePhotoData(data, contentType: contentType)
+        } catch {
+            guard !Task.isCancelled else { return }
+            photoLogger.error("Could not load selected photo: \(error.localizedDescription, privacy: .public)")
+            photoImportError = "\(error.localizedDescription) Please try selecting the photo again."
+        }
+    }
+    #endif
+
     @ViewBuilder
     private func conversationItemView(_ item: ConversationItem) -> some View {
         switch item.kind {
         case let .text(message):
             MessageBubble(message: message)
                 .contextMenu {
+                    Button {
+                        copyToPasteboard(copyableMessageText(message))
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
                     Button("Delete", role: .destructive) {
                         model.deleteConversationItem(item.id)
                     }
@@ -475,6 +556,21 @@ private struct ConversationView: View {
         }
     }
 
+    private func copyableMessageText(_ message: String) -> String {
+        if message.hasPrefix("You: ") { return String(message.dropFirst(5)) }
+        if message.hasPrefix("Peer: ") { return String(message.dropFirst(6)) }
+        return message
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = text
+        #else
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+    }
+
     private var peerConversationItems: [ConversationItem] {
         model.conversationItems.filter { $0.peerID == device.id }
     }
@@ -486,15 +582,16 @@ private struct ConversationView: View {
 
 private struct ConversationEmptyState: View {
     let deviceName: String
+    let isOnline: Bool
 
     var body: some View {
         VStack(spacing: 10) {
             Image(systemName: "bubble.left.and.bubble.right")
                 .font(.title2)
                 .foregroundStyle(.blue)
-            Text("Start a conversation")
+            Text(isOnline ? "Start a conversation" : "No messages yet")
                 .font(.headline)
-            Text("Send a message or attach a file to \(deviceName).")
+            Text(isOnline ? "Send a message or attach a file to \(deviceName)." : "You can send messages and files when \(deviceName) is online again.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -547,14 +644,14 @@ private struct ComposerBar: View {
     let chooseFile: () -> Void
     let send: () -> Void
     #if os(iOS)
-    @Binding var selectedPhoto: PhotosPickerItem?
+    let choosePhoto: () -> Void
     #endif
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 10) {
             Menu {
                 #if os(iOS)
-                PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                Button(action: choosePhoto) {
                     Label("Choose Photo", systemImage: "photo")
                 }
                 Divider()
@@ -569,8 +666,9 @@ private struct ComposerBar: View {
                 .background(Color.primary.opacity(0.06), in: Circle())
             }
             .accessibilityLabel("Attach photo or file")
+            .disabled(!canSend)
 
-            TextField("Write a message", text: $text, axis: .vertical)
+            TextField(canSend ? "Write a message" : "Device is offline", text: $text, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...4)
                 .focused(isFocused)
@@ -581,6 +679,7 @@ private struct ComposerBar: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(Color.primary.opacity(0.06), in: Capsule())
+                .disabled(!canSend)
 
             Button {
                 send()
@@ -880,6 +979,7 @@ private extension DevicePlatform {
         case .iOS: "iOS"
         case .android: "Android"
         case .windows: "Windows"
+        case .unknown: "Saved device"
         }
     }
 
@@ -889,6 +989,7 @@ private extension DevicePlatform {
         case .iOS: "iphone"
         case .android: "apps.iphone"
         case .windows: "desktopcomputer"
+        case .unknown: "network"
         }
     }
 }
@@ -896,4 +997,21 @@ private extension DevicePlatform {
 #Preview {
     ContentView()
         .environmentObject(NearLinkAppModel())
+}
+
+#Preview("Device presence") {
+    VStack(spacing: 12) {
+        DeviceRow(
+            device: NearbyDevice(name: "MacBook Pro", platform: .macOS),
+            isOnline: true,
+            preview: ConversationPreview(text: "Sent file", timestamp: .distantPast, unreadCount: 0)
+        )
+        DeviceRow(
+            device: NearbyDevice(name: "iPhone", platform: .iOS),
+            isOnline: false,
+            preview: ConversationPreview(text: "See you tomorrow", timestamp: .distantPast, unreadCount: 2)
+        )
+    }
+    .padding()
+    .frame(width: 370)
 }

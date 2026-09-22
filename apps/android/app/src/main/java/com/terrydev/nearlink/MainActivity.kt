@@ -1,6 +1,9 @@
 package com.terrydev.nearlink
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -221,6 +224,7 @@ private fun NearbyHomeScreen(
                 items(model.devices, key = { it.id }) { device ->
                     DeviceCard(
                         device = device,
+                        isOnline = model.isDeviceOnline(device.id),
                         preview = model.conversationPreview(device.id),
                         onClick = { onDeviceSelected(device) }
                     )
@@ -281,6 +285,7 @@ private fun NearbyEmptyCard() {
 @Composable
 private fun DeviceCard(
     device: NearbyDevice,
+    isOnline: Boolean,
     preview: ConversationPreview?,
     onClick: () -> Unit
 ) {
@@ -299,12 +304,7 @@ private fun DeviceCard(
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(device.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 if (preview == null) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(8.dp).clip(CircleShape).background(Color(0xFF35C759)))
-                        Spacer(Modifier.width(6.dp))
-                        Text(platformName(device), style = MaterialTheme.typography.bodyMedium, color = NearLinkSecondaryText)
-                        Text(" · Available", style = MaterialTheme.typography.bodyMedium, color = NearLinkSecondaryText)
-                    }
+                    Text(platformName(device), style = MaterialTheme.typography.bodyMedium, color = NearLinkSecondaryText)
                 } else {
                     Text(
                         preview.text,
@@ -319,6 +319,7 @@ private fun DeviceCard(
                 horizontalAlignment = Alignment.End,
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                DeviceStatusChip(isOnline)
                 if (preview != null) {
                     Text(
                         formatConversationTime(preview.timestamp),
@@ -340,6 +341,21 @@ private fun DeviceCard(
                     Text("›", fontSize = 30.sp, color = Color(0xFFB7BAC2))
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun DeviceStatusChip(isOnline: Boolean) {
+    val color = if (isOnline) Color(0xFF2DBE60) else Color(0xFFE5484D)
+    Surface(shape = RoundedCornerShape(16.dp), color = color.copy(alpha = 0.14f)) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(Modifier.size(6.dp).clip(CircleShape).background(color))
+            Spacer(Modifier.width(4.dp))
+            Text(if (isOnline) "Online" else "Offline", color = color, style = MaterialTheme.typography.labelMedium)
         }
     }
 }
@@ -382,7 +398,9 @@ private fun ConversationScreen(
     openFile: (Uri, String?) -> Unit,
     onBack: () -> Unit
 ) {
+    val isOnline = model.isDeviceOnline(device.id)
     val focusManager = LocalFocusManager.current
+    val context = LocalContext.current
     val listState = rememberLazyListState()
     val timeline = model.timeline.filter { it.peerID == device.id }
     var deleteTarget by remember { mutableStateOf<ConversationItem?>(null) }
@@ -407,11 +425,7 @@ private fun ConversationScreen(
                     IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Back") }
                 },
                 actions = {
-                    AssistChip(
-                        onClick = {},
-                        label = { Text("Available") },
-                        leadingIcon = { Box(Modifier.size(8.dp).clip(CircleShape).background(Color(0xFF35C759))) }
-                    )
+                    DeviceStatusChip(isOnline)
                 }
             )
         },
@@ -419,7 +433,8 @@ private fun ConversationScreen(
             MessageComposer(
                 text = model.draft.value,
                 onTextChanged = { model.draft.value = it },
-                canSend = model.selectedDevice.value != null && model.draft.value.isNotBlank(),
+                canSend = isOnline && model.draft.value.isNotBlank(),
+                isOnline = isOnline,
                 onChooseFile = chooseFile,
                 onSend = {
                     model.send()
@@ -435,8 +450,16 @@ private fun ConversationScreen(
                 .padding(padding)
                 .pointerInput(Unit) { detectTapGestures { focusManager.clearFocus() } }
         ) {
+            if (!isOnline) {
+                Text(
+                    "Device is offline. You can still view this conversation and saved files.",
+                    modifier = Modifier.align(Alignment.TopCenter).padding(horizontal = 20.dp, vertical = 10.dp),
+                    color = NearLinkSecondaryText,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
             if (timeline.isEmpty()) {
-                ConversationEmpty(device.name)
+                ConversationEmpty(device.name, isOnline)
             } else {
                 LazyColumn(
                     state = listState,
@@ -475,31 +498,51 @@ private fun ConversationScreen(
     deleteTarget?.let { item ->
         AlertDialog(
             onDismissRequest = { deleteTarget = null },
-            title = { Text("Delete message?") },
+            title = { Text(if (item is ConversationItem.Message) "Message actions" else "Delete transfer?") },
             text = {
                 Text(
                     if (item is ConversationItem.Transfer) {
                         "This removes the transfer from this conversation. Any file already saved to your device will be kept."
                     } else {
-                        "This removes the message from this conversation."
+                        "Copy this message or remove it from this conversation."
                     }
                 )
             },
             confirmButton = {
-                Button(onClick = {
-                    model.deleteConversationItem(item.id)
-                    deleteTarget = null
-                }) { Text("Delete") }
+                if (item is ConversationItem.Message) {
+                    Button(onClick = {
+                        copyMessage(context, item.text)
+                        deleteTarget = null
+                    }) { Text("Copy") }
+                } else {
+                    Button(onClick = {
+                        model.deleteConversationItem(item.id)
+                        deleteTarget = null
+                    }) { Text("Delete") }
+                }
             },
             dismissButton = {
-                Button(onClick = { deleteTarget = null }) { Text("Cancel") }
+                if (item is ConversationItem.Message) {
+                    Button(onClick = {
+                        model.deleteConversationItem(item.id)
+                        deleteTarget = null
+                    }) { Text("Delete") }
+                } else {
+                    Button(onClick = { deleteTarget = null }) { Text("Cancel") }
+                }
             }
         )
     }
 }
 
+private fun copyMessage(context: Context, text: String) {
+    val clipboard = context.getSystemService(ClipboardManager::class.java)
+    clipboard.setPrimaryClip(ClipData.newPlainText("NearLink message", text))
+    Toast.makeText(context, "Message copied", Toast.LENGTH_SHORT).show()
+}
+
 @Composable
-private fun ConversationEmpty(deviceName: String) {
+private fun ConversationEmpty(deviceName: String, isOnline: Boolean) {
     Column(
         modifier = Modifier.fillMaxSize().padding(28.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -507,8 +550,8 @@ private fun ConversationEmpty(deviceName: String) {
     ) {
         Icon(Icons.Default.IosShare, contentDescription = null, tint = NearLinkBlue, modifier = Modifier.size(42.dp))
         Spacer(Modifier.height(12.dp))
-        Text("Start a conversation", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-        Text("Send a message or attach a file to $deviceName.", color = NearLinkSecondaryText)
+        Text(if (isOnline) "Start a conversation" else "No messages yet", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+        Text(if (isOnline) "Send a message or attach a file to $deviceName." else "$deviceName is offline. You can send when it returns.", color = NearLinkSecondaryText)
     }
 }
 
@@ -647,6 +690,7 @@ private fun MessageComposer(
     text: String,
     onTextChanged: (String) -> Unit,
     canSend: Boolean,
+    isOnline: Boolean,
     onChooseFile: () -> Unit,
     onSend: () -> Unit,
     onDone: () -> Unit
@@ -662,14 +706,15 @@ private fun MessageComposer(
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            IconButton(onClick = onChooseFile) {
+            IconButton(onClick = onChooseFile, enabled = isOnline) {
                 Icon(Icons.Default.AttachFile, contentDescription = "Attach file", tint = NearLinkBlue)
             }
             TextField(
                 value = text,
                 onValueChange = onTextChanged,
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Write a message", color = NearLinkSecondaryText) },
+                placeholder = { Text(if (isOnline) "Write a message" else "Device is offline", color = NearLinkSecondaryText) },
+                enabled = isOnline,
                 maxLines = 4,
                 shape = RoundedCornerShape(24.dp),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),

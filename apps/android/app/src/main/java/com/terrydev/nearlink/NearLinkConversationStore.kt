@@ -19,7 +19,8 @@ class NearLinkConversationStore(context: Context) {
             ConversationHistory(
                 timeline = decodeTimeline(root.optJSONArray("timeline") ?: JSONArray()),
                 transfers = decodeTransfers(root.optJSONArray("transfers") ?: JSONArray()),
-                unreadCounts = decodeUnreadCounts(root.optJSONObject("unreadCounts") ?: JSONObject())
+                unreadCounts = decodeUnreadCounts(root.optJSONObject("unreadCounts") ?: JSONObject()),
+                devices = decodeDevices(root.optJSONArray("devices") ?: JSONArray())
             )
         }.getOrDefault(ConversationHistory())
     }
@@ -27,7 +28,8 @@ class NearLinkConversationStore(context: Context) {
     fun save(
         timeline: List<ConversationItem>,
         transfers: Collection<TransferItem>,
-        unreadCounts: Map<UUID, Int>
+        unreadCounts: Map<UUID, Int>,
+        devices: Collection<NearbyDevice>
     ) {
         val root = JSONObject()
         root.put("timeline", JSONArray().apply {
@@ -67,6 +69,15 @@ class NearLinkConversationStore(context: Context) {
         })
         root.put("unreadCounts", JSONObject().apply {
             unreadCounts.filterValues { it > 0 }.forEach { (peerID, count) -> put(peerID.toString(), count) }
+        })
+        root.put("devices", JSONArray().apply {
+            devices.sortedBy { it.id.toString() }.forEach { device ->
+                put(JSONObject()
+                    .put("id", device.id.toString())
+                    .put("name", device.name)
+                    .put("platform", device.platform)
+                    .put("protocolVersion", device.protocolVersion))
+            }
         })
         preferences.edit().putString(key, root.toString()).apply()
     }
@@ -119,6 +130,21 @@ class NearLinkConversationStore(context: Context) {
         }
     }
 
+    private fun decodeDevices(items: JSONArray): List<NearbyDevice> = buildList {
+        repeat(items.length()) { index ->
+            val item = items.optJSONObject(index) ?: return@repeat
+            val id = item.uuid("id") ?: return@repeat
+            add(NearbyDevice(
+                id = id,
+                name = item.optString("name", "Saved device ${id.toString().take(6)}"),
+                platform = item.optString("platform", "unknown"),
+                host = "",
+                port = 0,
+                protocolVersion = item.optInt("protocolVersion", NearLinkProtocol.VERSION)
+            ))
+        }
+    }
+
     private fun JSONObject.uuid(key: String): UUID? =
         optStringOrNull(key)?.let { runCatching { UUID.fromString(it) }.getOrNull() }
 
@@ -129,5 +155,6 @@ class NearLinkConversationStore(context: Context) {
 data class ConversationHistory(
     val timeline: List<ConversationItem> = emptyList(),
     val transfers: List<TransferItem> = emptyList(),
-    val unreadCounts: Map<UUID, Int> = emptyMap()
+    val unreadCounts: Map<UUID, Int> = emptyMap(),
+    val devices: List<NearbyDevice> = emptyList()
 )

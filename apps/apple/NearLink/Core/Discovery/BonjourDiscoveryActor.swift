@@ -86,7 +86,7 @@ actor BonjourDiscoveryActor {
 
         let browserParameters = webSocketParameters()
         browserParameters.includePeerToPeer = true
-        let browser = NWBrowser(for: .bonjour(type: NearLinkProtocol.serviceType, domain: nil), using: browserParameters)
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: NearLinkProtocol.serviceType, domain: nil), using: browserParameters)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             Task { await self?.publish(results) }
         }
@@ -95,12 +95,18 @@ actor BonjourDiscoveryActor {
     }
 
     private func publish(_ results: Set<NWBrowser.Result>) {
+        // A device that disappeared must no longer have a routable cached endpoint.
+        endpoints.removeAll()
         let devices = results.compactMap { result -> NearbyDevice? in
             guard case let .service(name, _, _, _) = result.endpoint else { return nil }
-            // When the legacy browser API omits TXT metadata, this is the only
-            // stable pre-connection signal that the advertised service is ours.
-            guard name != localDevice.name else { return nil }
-            let record = result.endpoint.txtRecord?.dictionary ?? [:]
+            let record: [String: String]
+            if case let .bonjour(txtRecord) = result.metadata {
+                record = txtRecord.dictionary
+            } else {
+                record = result.endpoint.txtRecord?.dictionary ?? [:]
+            }
+            // Prefer persistent identity over names, which may be shared by peers.
+            if record["deviceId"] == nil, name == localDevice.name { return nil }
             let id = UUID(uuidString: record["deviceId"] ?? "") ?? knownDeviceIDs[name] ?? UUID()
             guard id != localDevice.id else { return nil }
             // Some Network.framework browse results omit TXT records even when the

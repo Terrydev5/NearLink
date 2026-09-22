@@ -40,6 +40,7 @@ private fun persistentDeviceID(app: Application): UUID {
 
 class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     val devices = mutableStateListOf<NearbyDevice>()
+    val onlineDeviceIDs = mutableStateMapOf<UUID, Boolean>()
     val timeline = mutableStateListOf<ConversationItem>()
     val transfers = mutableStateMapOf<UUID, TransferItem>()
     val unreadMessageCounts = mutableStateMapOf<UUID, Int>()
@@ -60,6 +61,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     private val discovery = NearbyDiscovery(app, local)
     private val storage = NearLinkFileStorage(app)
     private val conversationStore = NearLinkConversationStore(app)
+    private val nearbyDevices = mutableMapOf<UUID, NearbyDevice>()
+    private val knownDevices = mutableMapOf<UUID, NearbyDevice>()
     private val transport = NearLinkTransport(
         localDevice = local,
         messageHandler = { peerID, raw -> handleControlMessage(raw, null, "", peerID) },
@@ -84,8 +87,9 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         server.start()
         discovery.start(
             onChanged = { found ->
-                devices.clear()
-                devices.addAll(found.filter { it.id != local.id && it.name != local.name })
+                viewModelScope.launch(Dispatchers.Main) {
+                    updateNearbyDevices(found.filter { it.id != local.id && it.name != local.name })
+                }
             },
             onStatus = { status -> discoveryStatus.value = status }
         )
@@ -94,6 +98,10 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     fun stageFile(uri: Uri) {
         val target = selectedDevice.value ?: run {
             appendSystemMessage("Select a nearby device before choosing a file")
+            return
+        }
+        if (!isDeviceOnline(target.id)) {
+            appendSystemMessage("Could not send file: device is offline", target.id)
             return
         }
         val resolver = getApplication<Application>().contentResolver
@@ -133,6 +141,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     )
                     timeline.add(ConversationItem.Transfer(UUID.randomUUID(), target.id, transferID!!))
+                    rememberPeer(target.id)
                     persistConversationHistory()
                 }
                 Log.d(TAG, "Offering ${metadata.name} (${metadata.size} bytes) to ${target.name} on port ${socket.localPort}")
@@ -243,8 +252,9 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
                 viewModelScope.launch(Dispatchers.Main) {
                     discovery.reconcileDeviceID(peer.id, remoteHost, peer.name)?.let { provisionalID ->
                         Log.d(TAG, "Reconciled discovered device $provisionalID to ${peer.id}")
-                        reconcileDeviceIdentity(provisionalID, peer.id)
+                        reconcileDeviceIdentity(provisionalID, peer)
                     }
+                    rememberDevice(peer)
                 }
             }
         }
@@ -272,6 +282,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
                 )
             )
             if (peerID != null) {
+                rememberPeer(peerID)
                 timeline.add(ConversationItem.Transfer(UUID.randomUUID(), peerID, transfer.id))
                 markConversationUnreadIfNeeded(peerID, incoming = true)
                 persistConversationHistory()
@@ -377,7 +388,12 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         val text = draft.value.trim()
         val target = selectedDevice.value ?: return
         if (text.isEmpty()) return
+        if (!isDeviceOnline(target.id)) {
+            appendSystemMessage("Could not send: device is offline. Your draft is kept.", target.id)
+            return
+        }
         draft.value = ""
+        rememberDevice(target)
         runCatching { transport.sendText(target, text) }
             .onSuccess { appendMessage(text, peerID = target.id, outgoing = true) }
             .onFailure { appendSystemMessage("Message failed: ${it.localizedMessage ?: "unknown error"}") }
@@ -426,9 +442,49 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         selectedDevice.value = null
     }
 
+    fun isDeviceOnline(deviceID: UUID): Boolean = onlineDeviceIDs[deviceID] == true
+
+    private fun updateNearbyDevices(found: List<NearbyDevice>) {
+        nearbyDevices.clear()
+        found.forEach { device -> nearbyDevices[device.id] = device }
+        onlineDeviceIDs.clear()
+        found.forEach { onlineDeviceIDs[it.id] = true }
+        found.filter { it.id in knownDevices }.forEach { device ->
+            knownDevices[device.id] = device.historyProfile()
+        }
+        rebuildDeviceList()
+    }
+
+    private fun rememberDevice(device: NearbyDevice) {
+        val profile = device.historyProfile()
+        if (knownDevices[device.id] == profile) return
+        knownDevices[device.id] = profile
+        rebuildDeviceList()
+        persistConversationHistory()
+    }
+
+    private fun rememberPeer(peerID: UUID) {
+        knownDevices[peerID] = nearbyDevices[peerID]?.historyProfile()
+            ?: knownDevices[peerID]
+            ?: historicalDevice(peerID)
+        rebuildDeviceList()
+    }
+
+    private fun rebuildDeviceList() {
+        val visible = knownDevices.toMutableMap()
+        visible.putAll(nearbyDevices)
+        devices.clear()
+        devices.addAll(visible.values.sortedWith(
+            compareByDescending<NearbyDevice> { isDeviceOnline(it.id) }
+                .thenBy { it.name.lowercase() }
+                .thenBy { it.id.toString() }
+        ))
+    }
+
     private fun appendMessage(text: String, peerID: UUID?, outgoing: Boolean) {
         viewModelScope.launch(Dispatchers.Main) {
             if (peerID != null) {
+                rememberPeer(peerID)
                 timeline.add(ConversationItem.Message(UUID.randomUUID(), peerID, text, outgoing, false))
                 markConversationUnreadIfNeeded(peerID, incoming = !outgoing)
                 persistConversationHistory()
@@ -439,6 +495,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     private fun appendSystemMessage(text: String, peerID: UUID? = selectedDevice.value?.id) {
         viewModelScope.launch(Dispatchers.Main) {
             if (peerID != null) {
+                rememberPeer(peerID)
                 timeline.add(ConversationItem.Message(UUID.randomUUID(), peerID, text, false, true))
                 persistConversationHistory()
             }
@@ -522,10 +579,17 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         return runCatching { UUID.fromString(payload.optString("transferID")) }.getOrNull()
     }
 
-    private fun parseHelloDevice(raw: String): HelloDevice? {
+    private fun parseHelloDevice(raw: String): NearbyDevice? {
         val device = JSONObject(raw).optJSONObject("payload")?.optJSONObject("device") ?: return null
         val id = runCatching { UUID.fromString(device.optString("id")) }.getOrNull() ?: return null
-        return HelloDevice(id, device.optString("name").takeUnless { it.isBlank() })
+        return NearbyDevice(
+            id = id,
+            name = device.optString("name").takeUnless { it.isBlank() } ?: "Saved device ${id.toString().take(6)}",
+            platform = device.optString("platform", "unknown"),
+            host = "",
+            port = 0,
+            protocolVersion = device.optInt("protocolVersion", NearLinkProtocol.VERSION)
+        )
     }
 
     /**
@@ -641,6 +705,11 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
             transfers[restored.id] = restored
         }
         unreadMessageCounts.putAll(history.unreadCounts)
+        history.devices.forEach { device -> knownDevices[device.id] = device.historyProfile() }
+        (timeline.map { it.peerID } + transfers.values.mapNotNull { it.peerID }).forEach { peerID ->
+            if (peerID !in knownDevices) knownDevices[peerID] = historicalDevice(peerID)
+        }
+        rebuildDeviceList()
         if (timeline.isNotEmpty() || transfers.isNotEmpty()) {
             Log.d(TAG, "Restored ${timeline.size} conversation item(s), ${transfers.size} transfer(s), and ${unreadMessageCounts.size} unread conversation(s)")
         }
@@ -648,7 +717,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun persistConversationHistory() {
-        conversationStore.save(timeline, transfers.values, unreadMessageCounts)
+        conversationStore.save(timeline, transfers.values, unreadMessageCounts, knownDevices.values)
         Log.d(TAG, "Persisted ${timeline.size} conversation item(s), ${transfers.size} transfer(s)")
     }
 
@@ -667,7 +736,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun reconcileDeviceIdentity(provisionalID: UUID, verifiedID: UUID) {
+    private fun reconcileDeviceIdentity(provisionalID: UUID, verifiedDevice: NearbyDevice) {
+        val verifiedID = verifiedDevice.id
         if (provisionalID == verifiedID) return
         timeline.indices.forEach { index ->
             timeline[index] = when (val item = timeline[index]) {
@@ -684,6 +754,12 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         selectedDevice.value?.takeIf { it.id == provisionalID }?.let { selected ->
             selectedDevice.value = selected.copy(id = verifiedID)
         }
+        knownDevices.remove(provisionalID)
+        knownDevices[verifiedID] = verifiedDevice.historyProfile()
+        nearbyDevices.remove(provisionalID)?.let { nearbyDevices[verifiedID] = it.copy(id = verifiedID) }
+        onlineDeviceIDs.remove(provisionalID)
+        if (verifiedID in nearbyDevices) onlineDeviceIDs[verifiedID] = true
+        rebuildDeviceList()
         persistConversationHistory()
     }
 
@@ -731,8 +807,6 @@ private data class IncomingTransfer(
     val remoteHost: String,
     val sender: suspend (String) -> Unit
 )
-
-private data class HelloDevice(val id: UUID, val name: String?)
 
 enum class TransferStatus {
     WAITING,

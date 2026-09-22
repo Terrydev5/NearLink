@@ -31,6 +31,8 @@ docs/          public project and GitHub preparation notes
 
 Open `apps/apple/NearLink.xcodeproj` in a current Xcode release and select a physical iPhone, iPad, or Mac target.
 
+On macOS, run `zsh apps/apple/scripts/test-device-history.sh` to check saved-device persistence, offline history access, reconnection, identity migration, and offline send guards using isolated test storage.
+
 Open `apps/android` in Android Studio with Android SDK 35 and JDK 17. The debug APK can also be built from that directory with:
 
 ```bash

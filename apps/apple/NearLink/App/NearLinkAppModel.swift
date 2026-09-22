@@ -9,7 +9,9 @@ import Photos
 
 @MainActor
 final class NearLinkAppModel: ObservableObject {
+    private static let legacyHistoryDeviceID = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
     @Published private(set) var devices: [NearbyDevice] = []
+    @Published private(set) var onlineDeviceIDs: Set<UUID> = []
     @Published private(set) var transfers: [TransferSnapshot] = []
     @Published private(set) var conversationItems: [ConversationItem] = []
     @Published private(set) var discoveryStatus = "Starting discovery…"
@@ -24,7 +26,9 @@ final class NearLinkAppModel: ObservableObject {
 
     private let discovery = BonjourDiscoveryActor(localDevice: .local)
     private let transferActor = TransferActor()
-    private let conversationStore = ConversationHistoryStore()
+    private let conversationStore: ConversationHistoryStore
+    private var nearbyDevices: [NearbyDevice] = []
+    private var knownDevices: [UUID: NearbyDevice] = [:]
     private var discoveryTask: Task<Void, Never>?
     private var incomingConnectionTask: Task<Void, Never>?
     private var outboundConnections: [UUID: WebSocketConnectionActor] = [:]
@@ -39,10 +43,67 @@ final class NearLinkAppModel: ObservableObject {
     private var appWasBackgrounded = false
     private var discoveryRestartTask: Task<Void, Never>?
 
+    convenience init() {
+        self.init(conversationStore: ConversationHistoryStore())
+    }
+
+    init(conversationStore: ConversationHistoryStore) {
+        self.conversationStore = conversationStore
+        restoreConversationHistory()
+    }
+
+    func isDeviceOnline(_ deviceID: UUID) -> Bool {
+        onlineDeviceIDs.contains(deviceID)
+    }
+
+    func updateNearbyDevices(_ nearby: [NearbyDevice]) {
+        nearbyDevices = nearby
+        onlineDeviceIDs = Set(nearby.map(\.id))
+        var profilesChanged = false
+        for device in nearby where knownDevices[device.id] != nil {
+            let profile = device.historyProfile
+            if knownDevices[device.id] != profile {
+                knownDevices[device.id] = profile
+                profilesChanged = true
+            }
+        }
+        rebuildDeviceList()
+        discoveryStatus = nearby.isEmpty ? "Searching nearby devices" : "\(onlineDeviceIDs.count) nearby device\(onlineDeviceIDs.count == 1 ? "" : "s")"
+        if profilesChanged { persistConversationHistory() }
+    }
+
+    /// Remember peers after connecting or exchanging content, not every passerby.
+    func rememberDevice(_ device: NearbyDevice) {
+        let profile = device.historyProfile
+        guard knownDevices[device.id] != profile else { return }
+        knownDevices[device.id] = profile
+        rebuildDeviceList()
+        persistConversationHistory()
+    }
+
+    private func rememberPeer(_ peerID: UUID) {
+        let device = nearbyDevices.first { $0.id == peerID }
+            ?? knownDevices[peerID]
+            ?? .historicalPlaceholder(id: peerID)
+        knownDevices[peerID] = device.historyProfile
+        rebuildDeviceList()
+    }
+
+    private func rebuildDeviceList() {
+        var visible = knownDevices
+        for device in nearbyDevices { visible[device.id] = device }
+        devices = visible.values.sorted { lhs, rhs in
+            let lhsOnline = isDeviceOnline(lhs.id)
+            let rhsOnline = isDeviceOnline(rhs.id)
+            if lhsOnline != rhsOnline { return lhsOnline }
+            let order = lhs.name.localizedStandardCompare(rhs.name)
+            return order == .orderedSame ? lhs.id.uuidString < rhs.id.uuidString : order == .orderedAscending
+        }
+    }
+
     func start() {
         guard discoveryTask == nil, discoveryRestartTask == nil else { return }
         logger.info("Starting local discovery and listener")
-        restoreConversationHistory()
         Task {
             transfers = await transferActor.restoreHistory()
         }
@@ -50,8 +111,7 @@ final class NearLinkAppModel: ObservableObject {
             let updates = await discovery.deviceUpdates()
             for await devices in updates {
                 guard !Task.isCancelled else { return }
-                self?.devices = devices
-                self?.discoveryStatus = devices.isEmpty ? "Searching nearby devices" : "\(devices.count) nearby device\(devices.count == 1 ? "" : "s")"
+                self?.updateNearbyDevices(devices)
             }
         }
         incomingConnectionTask = Task { [weak self, discovery] in
@@ -75,8 +135,7 @@ final class NearLinkAppModel: ObservableObject {
         discoveryTask = nil
         incomingConnectionTask?.cancel()
         incomingConnectionTask = nil
-        devices = []
-        discoveryStatus = "Searching nearby devices"
+        updateNearbyDevices([])
         discoveryRestartTask = Task { [weak self] in
             guard let self else { return }
             await discovery.stop()
@@ -92,6 +151,7 @@ final class NearLinkAppModel: ObservableObject {
 
     func stop() {
         logger.info("Stopping discovery and active connections")
+        updateNearbyDevices([])
         discoveryTask?.cancel()
         discoveryTask = nil
         incomingConnectionTask?.cancel()
@@ -124,6 +184,10 @@ final class NearLinkAppModel: ObservableObject {
             appendMessage("Select a nearby device before sending.")
             return
         }
+        guard isDeviceOnline(selectedDeviceID) else {
+            appendMessage("Could not send: device is offline. Your draft is kept.", peerID: selectedDeviceID)
+            return
+        }
         messageText = ""
         Task {
             do {
@@ -139,6 +203,10 @@ final class NearLinkAppModel: ObservableObject {
     func stageFile(_ fileURL: URL) {
         guard let selectedDeviceID else {
             appendMessage("Select a nearby device before offering a file.")
+            return
+        }
+        guard isDeviceOnline(selectedDeviceID) else {
+            appendMessage("Could not send file: device is offline.", peerID: selectedDeviceID)
             return
         }
         let needsSecurityScope = fileURL.startAccessingSecurityScopedResource()
@@ -182,6 +250,7 @@ final class NearLinkAppModel: ObservableObject {
                 outboundFileAccess[snapshot.id] = OutgoingFileAccess(url: fileURL, needsSecurityScope: needsSecurityScope)
                 transfers = await transferActor.allSnapshots()
             } catch {
+                logger.error("Could not prepare outgoing file: \(error.localizedDescription, privacy: .public)")
                 if let server { await server.stop() }
                 if let transferID {
                     _ = try? await transferActor.transition(transferID, to: .failed, errorDescription: error.localizedDescription)
@@ -204,8 +273,10 @@ final class NearLinkAppModel: ObservableObject {
             let fileExtension = contentType?.preferredFilenameExtension ?? "jpg"
             let photoURL = stagingDirectory.appendingPathComponent("photo-\(UUID().uuidString).\(fileExtension)")
             try data.write(to: photoURL, options: .atomic)
+            logger.notice("Staged selected photo: \(data.count, privacy: .public) bytes; preparing transfer")
             stageFile(photoURL)
         } catch {
+            logger.error("Could not stage selected photo: \(error.localizedDescription, privacy: .public)")
             appendMessage("Could not stage selected photo: \(error.localizedDescription)", peerID: selectedDeviceID)
         }
     }
@@ -417,6 +488,9 @@ final class NearLinkAppModel: ObservableObject {
     }
 
     private func connection(for deviceID: UUID) async throws -> WebSocketConnectionActor {
+        guard isDeviceOnline(deviceID) else {
+            throw NearLinkError.connectionFailed("Device is offline")
+        }
         if let connection = outboundConnections[deviceID] {
             if await connection.isConnected() { return connection }
             logger.debug("Replacing stale control connection for \(deviceID.uuidString, privacy: .public)")
@@ -433,22 +507,25 @@ final class NearLinkAppModel: ObservableObject {
         connectionPeerIDs[ObjectIdentifier(connection)] = deviceID
         logger.debug("Opened outbound control connection for \(deviceID.uuidString, privacy: .public)")
         try await connection.send(NearLinkEnvelope(type: .hello, payload: HelloPayload(device: .local)))
+        if let device = nearbyDevices.first(where: { $0.id == deviceID }) {
+            rememberDevice(device)
+        }
         await connection.startHeartbeat()
         observe(connection)
         return connection
     }
 
     /// Keeps the Bonjour-visible device and every UI-facing reference aligned
-    /// with the stable device ID supplied by the authenticated control hello.
+    /// with the stable device ID supplied by the control hello.
     /// Without this migration, an incoming message can be stored under the
     /// hello ID while ConversationView filters on a temporary Bonjour UUID.
-    private func reconcileDeviceIdentity(discoveredID: UUID?, verifiedDevice: NearbyDevice) {
-        let fallbackID = devices.first(where: { $0.name == verifiedDevice.name })?.id
-        guard let previousID = discoveredID ?? fallbackID else { return }
+    func reconcileDeviceIdentity(discoveredID: UUID?, verifiedDevice: NearbyDevice) {
+        let fallbackID = nearbyDevices.first(where: { $0.name == verifiedDevice.name })?.id
+        let previousID = discoveredID ?? fallbackID
 
-        if let index = devices.firstIndex(where: { $0.id == previousID || $0.name == verifiedDevice.name }) {
-            let current = devices[index]
-            devices[index] = NearbyDevice(
+        if let previousID, let index = nearbyDevices.firstIndex(where: { $0.id == previousID }) {
+            let current = nearbyDevices[index]
+            nearbyDevices[index] = NearbyDevice(
                 id: verifiedDevice.id,
                 name: current.name,
                 platform: verifiedDevice.platform,
@@ -457,7 +534,16 @@ final class NearLinkAppModel: ObservableObject {
             )
         }
 
-        guard previousID != verifiedDevice.id else { return }
+        if let previousID, previousID != verifiedDevice.id {
+            knownDevices.removeValue(forKey: previousID)
+        }
+        knownDevices[verifiedDevice.id] = verifiedDevice.historyProfile
+        onlineDeviceIDs = Set(nearbyDevices.map(\.id))
+        rebuildDeviceList()
+        guard let previousID, previousID != verifiedDevice.id else {
+            persistConversationHistory()
+            return
+        }
         logger.notice("Migrating UI peer identity \(previousID.uuidString, privacy: .public) → \(verifiedDevice.id.uuidString, privacy: .public)")
 
         if selectedDeviceID == previousID {
@@ -611,6 +697,7 @@ final class NearLinkAppModel: ObservableObject {
     private func appendMessage(_ message: String, peerID: UUID? = nil, isIncoming: Bool = false) {
         messages.insert(message, at: 0)
         guard let peerID else { return }
+        rememberPeer(peerID)
         conversationItems.append(
             ConversationItem(peerID: peerID, kind: .text(message), isIncoming: isIncoming)
         )
@@ -619,6 +706,7 @@ final class NearLinkAppModel: ObservableObject {
     }
 
     private func appendTransferItem(_ transferID: UUID, peerID: UUID, isIncoming: Bool) {
+        rememberPeer(peerID)
         conversationItems.append(
             ConversationItem(peerID: peerID, kind: .transfer(transferID), isIncoming: isIncoming)
         )
@@ -627,14 +715,43 @@ final class NearLinkAppModel: ObservableObject {
     }
 
     private func restoreConversationHistory() {
-        guard conversationItems.isEmpty else { return }
         let history = conversationStore.load()
         conversationItems = history.items
         unreadMessageCounts = history.unreadCounts
+        for device in history.devices { knownDevices[device.id] = device.historyProfile }
+        let legacyPeerIDs = Set(history.items.map(\.peerID)).filter { peerID in
+            guard let device = knownDevices[peerID] else { return true }
+            // Earlier versions already wrote these synthetic placeholders to
+            // disk. Treat them as legacy too so an upgrade fixes existing rows.
+            return device.platform == .unknown && device.name.hasPrefix("Saved device ")
+        }
+        // v1 saved only peer UUIDs. They could be temporary Bonjour identities,
+        // so render their histories together instead of inventing one device per UUID.
+        if !legacyPeerIDs.isEmpty {
+            let legacyID = Self.legacyHistoryDeviceID
+            legacyPeerIDs.forEach { knownDevices.removeValue(forKey: $0) }
+            knownDevices[legacyID] = NearbyDevice(id: legacyID, name: "Previous device records", platform: .unknown)
+            conversationItems = conversationItems.map { item in
+                guard legacyPeerIDs.contains(item.peerID) else { return item }
+                return ConversationItem(id: item.id, peerID: legacyID, timestamp: item.timestamp, kind: item.kind, isIncoming: item.isIncoming)
+            }
+            let legacyUnread = legacyPeerIDs.reduce(0) { $0 + (unreadMessageCounts.removeValue(forKey: $1) ?? 0) }
+            if legacyUnread > 0 { unreadMessageCounts[legacyID] = legacyUnread }
+            for (transferID, peerID) in transferPeerIDs where legacyPeerIDs.contains(peerID) {
+                transferPeerIDs[transferID] = legacyID
+            }
+            persistConversationHistory()
+        }
+        for item in conversationItems {
+            if case let .transfer(transferID) = item.kind {
+                transferPeerIDs[transferID] = item.peerID
+            }
+        }
+        rebuildDeviceList()
     }
 
     private func persistConversationHistory() {
-        conversationStore.save(items: conversationItems, unreadCounts: unreadMessageCounts)
+        conversationStore.save(items: conversationItems, unreadCounts: unreadMessageCounts, devices: Array(knownDevices.values))
     }
 
     private func markConversationUnreadIfNeeded(_ peerID: UUID, isIncoming: Bool) {

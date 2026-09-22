@@ -23,6 +23,16 @@ data class NearbyDevice(
     val protocolVersion: Int = NearLinkProtocol.VERSION
 )
 
+fun NearbyDevice.historyProfile(): NearbyDevice = copy(host = "", port = 0)
+
+fun historicalDevice(id: UUID): NearbyDevice = NearbyDevice(
+    id = id,
+    name = "Saved device ${id.toString().take(6)}",
+    platform = "unknown",
+    host = "",
+    port = 0
+)
+
 object Envelope {
     fun hello(device: NearbyDevice): String = JSONObject()
         .put("version", NearLinkProtocol.VERSION)
