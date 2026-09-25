@@ -20,6 +20,6 @@ The app advertises a local Bonjour/DNS-SD service and exchanges device metadata 
 
 Protocol version 2 transfers use a 256-bit, one-time token to authorize the temporary TCP data stream. Tokens expire after two minutes, and received files are checked with SHA-256. These safeguards reduce accidental or unauthorized use of the temporary listener and detect corruption; they do not provide end-to-end encryption or authenticate the identity of the remote person. Because the control channel is currently plaintext, a local-network attacker who can observe traffic can also observe a token.
 
-Android asks the user to accept or reject incoming file offers. The current Apple client starts receiving an incoming offer automatically, so Apple users should use NearLink only with visible nearby peers they trust.
+NearLink automatically starts receiving incoming file offers on Apple and Android, so use it only with visible nearby peers you trust.
 
 Use NearLink only on networks and with peers you trust. Do not send sensitive content until transport encryption and peer authentication are available. This project is experimental software and has not received an external security audit.

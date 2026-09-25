@@ -102,11 +102,20 @@ actor WebSocketConnectionActor {
         }
     }
 
-    func send<Payload>(_ envelope: NearLinkEnvelope<Payload>) throws where Payload: Codable & Sendable {
+    func send<Payload>(_ envelope: NearLinkEnvelope<Payload>) async throws where Payload: Codable & Sendable {
         guard currentState == .connected else { throw NearLinkError.connectionFailed("Not connected") }
         let metadata = NWProtocolWebSocket.Metadata(opcode: .text)
         let context = NWConnection.ContentContext(identifier: envelope.messageID.uuidString, metadata: [metadata])
-        connection.send(content: try codec.encode(envelope), contentContext: context, isComplete: true, completion: .idempotent)
+        let data = try codec.encode(envelope)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed { error in
+                if let error {
+                    continuation.resume(throwing: NearLinkError.connectionFailed(error.localizedDescription))
+                } else {
+                    continuation.resume(returning: ())
+                }
+            })
+        }
     }
 
     func cancel() {

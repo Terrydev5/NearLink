@@ -9,6 +9,7 @@ import Photos
 
 @MainActor
 final class NearLinkAppModel: ObservableObject {
+    private static let maximumBatchTransferCount = 10
     private static let legacyHistoryDeviceID = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
     @Published private(set) var devices: [NearbyDevice] = []
     @Published private(set) var onlineDeviceIDs: Set<UUID> = []
@@ -34,6 +35,7 @@ final class NearLinkAppModel: ObservableObject {
     private var outboundConnections: [UUID: WebSocketConnectionActor] = [:]
     private var inboundConnections: [WebSocketConnectionActor] = []
     private var connectionPeerIDs: [ObjectIdentifier: UUID] = [:]
+    private var pendingMessageAcknowledgements: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var outboundFileServers: [UUID: OutboundFileServer] = [:]
     private var outboundFileAccess: [UUID: OutgoingFileAccess] = [:]
     private var incomingOffers: [UUID: IncomingOffer] = [:]
@@ -145,8 +147,10 @@ final class NearLinkAppModel: ObservableObject {
     }
 
     func appDidEnterBackground() {
+        guard !appWasBackgrounded else { return }
         appWasBackgrounded = true
-        logger.info("Scene entered background; Bonjour may be suspended by iOS")
+        logger.info("Scene entered background; invalidating control connections before iOS suspends networking")
+        invalidateControlConnections(reason: "The app entered the background")
     }
 
     func stop() {
@@ -156,15 +160,7 @@ final class NearLinkAppModel: ObservableObject {
         discoveryTask = nil
         incomingConnectionTask?.cancel()
         incomingConnectionTask = nil
-        outboundConnections.values.forEach { connection in
-            Task { await connection.cancel() }
-        }
-        outboundConnections.removeAll()
-        inboundConnections.forEach { connection in
-            Task { await connection.cancel() }
-        }
-        inboundConnections.removeAll()
-        connectionPeerIDs.removeAll()
+        invalidateControlConnections(reason: "The app stopped")
         outboundFileServers.values.forEach { server in
             Task { await server.stop() }
         }
@@ -188,14 +184,15 @@ final class NearLinkAppModel: ObservableObject {
             appendMessage("Could not send: device is offline. Your draft is kept.", peerID: selectedDeviceID)
             return
         }
-        messageText = ""
         Task {
             do {
                 let connection = try await connection(for: selectedDeviceID)
-                try await connection.send(NearLinkEnvelope(type: .textMessage, payload: TextMessagePayload(text: text)))
+                let envelope = NearLinkEnvelope(type: .textMessage, payload: TextMessagePayload(text: text))
+                try await sendMessageAndWaitForAcknowledgement(envelope, over: connection)
+                messageText = ""
                 appendMessage("You: \(text)", peerID: selectedDeviceID)
             } catch {
-                appendMessage("Message failed: \(error.localizedDescription)", peerID: selectedDeviceID)
+                appendMessage("Message failed: \(error.localizedDescription). Your draft is kept.", peerID: selectedDeviceID)
             }
         }
     }
@@ -260,6 +257,15 @@ final class NearLinkAppModel: ObservableObject {
                 appendMessage("Could not prepare \(fileURL.lastPathComponent): \(error.localizedDescription)", peerID: selectedDeviceID)
             }
         }
+    }
+
+    func stageFiles(_ fileURLs: [URL]) {
+        guard !fileURLs.isEmpty else { return }
+        guard fileURLs.count <= Self.maximumBatchTransferCount else {
+            appendMessage("Choose up to \(Self.maximumBatchTransferCount) files at a time.", peerID: selectedDeviceID)
+            return
+        }
+        fileURLs.forEach(stageFile)
     }
 
     func stagePhotoData(_ data: Data, contentType: UTType? = nil) {
@@ -458,7 +464,11 @@ final class NearLinkAppModel: ObservableObject {
                     )
                 }
             }
-        case .ack, .heartbeatAck:
+        case .ack:
+            if let envelope = try? ProtocolCodec().decode(NearLinkEnvelope<AckPayload>.self, from: data) {
+                resolveMessageAcknowledgement(envelope.payload.messageID)
+            }
+        case .heartbeatAck:
             break
         default:
             appendMessage("Received \(header.type.rawValue)", isIncoming: true)
@@ -599,6 +609,64 @@ final class NearLinkAppModel: ObservableObject {
     private func sendAcknowledgement(for messageID: UUID, over connection: WebSocketConnectionActor) {
         Task {
             try? await connection.send(NearLinkEnvelope(type: .ack, payload: AckPayload(messageID: messageID)))
+        }
+    }
+
+    /// An NWConnection can stay marked ready after iOS has suspended the app.
+    /// Clear these sockets on backgrounding so the next foreground send creates
+    /// a fresh control channel instead of writing to a stale one.
+    private func invalidateControlConnections(reason: String) {
+        var seenConnections = Set<ObjectIdentifier>()
+        let connections = Array(outboundConnections.values) + inboundConnections
+        outboundConnections.removeAll()
+        inboundConnections.removeAll()
+        connectionPeerIDs.removeAll()
+        failAllMessageAcknowledgements(reason: reason)
+
+        for connection in connections where seenConnections.insert(ObjectIdentifier(connection)).inserted {
+            Task { await connection.cancel() }
+        }
+    }
+
+    /// A successful local `send` only means Network accepted the bytes. Wait
+    /// for the peer's protocol ACK before adding the message to the history.
+    private func sendMessageAndWaitForAcknowledgement(
+        _ envelope: NearLinkEnvelope<TextMessagePayload>,
+        over connection: WebSocketConnectionActor
+    ) async throws {
+        let messageID = envelope.messageID
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            pendingMessageAcknowledgements[messageID] = continuation
+            Task { [weak self] in
+                do {
+                    try await connection.send(envelope)
+                    try await Task.sleep(for: .seconds(6))
+                    self?.failMessageAcknowledgement(
+                        messageID,
+                        reason: "The nearby device did not confirm delivery"
+                    )
+                } catch {
+                    self?.failMessageAcknowledgement(messageID, reason: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func resolveMessageAcknowledgement(_ messageID: UUID) {
+        pendingMessageAcknowledgements.removeValue(forKey: messageID)?.resume(returning: ())
+    }
+
+    private func failMessageAcknowledgement(_ messageID: UUID, reason: String) {
+        pendingMessageAcknowledgements.removeValue(forKey: messageID)?.resume(
+            throwing: NearLinkError.connectionFailed(reason)
+        )
+    }
+
+    private func failAllMessageAcknowledgements(reason: String) {
+        let acknowledgements = pendingMessageAcknowledgements
+        pendingMessageAcknowledgements.removeAll()
+        for continuation in acknowledgements.values {
+            continuation.resume(throwing: NearLinkError.connectionFailed(reason))
         }
     }
 

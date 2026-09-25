@@ -42,14 +42,10 @@ struct ContentView: View {
         .fileImporter(
             isPresented: $isImportingFile,
             allowedContentTypes: [.data, .image, .movie],
-            allowsMultipleSelection: false
+            allowsMultipleSelection: true
         ) { result in
-            guard case let .success(urls) = result, let url = urls.first else { return }
-            let accessingSecurityScopedResource = url.startAccessingSecurityScopedResource()
-            defer {
-                if accessingSecurityScopedResource { url.stopAccessingSecurityScopedResource() }
-            }
-            model.stageFile(url)
+            guard case let .success(urls) = result else { return }
+            model.stageFiles(urls)
         }
     }
 
@@ -326,9 +322,10 @@ private struct ConversationView: View {
     @State private var previewTransfer: TransferPreview?
     private var isOnline: Bool { model.isDeviceOnline(device.id) }
     #if os(iOS)
-    @State private var selectedPhoto: PhotosPickerItem?
+    @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var isChoosingPhoto = false
     @State private var isLoadingPhoto = false
+    @State private var photoImportProgress = 0
     @State private var photoImportError: String?
     private let photoLogger = Logger(subsystem: "cn.terrydev.NearLink", category: "photo-import")
     #endif
@@ -411,7 +408,7 @@ private struct ConversationView: View {
                 }
                 #if os(iOS)
                 if isLoadingPhoto {
-                    ProgressView("Loading photo…")
+                    ProgressView("Loading photos… \(photoImportProgress)/\(selectedPhotos.count)")
                         .padding(8)
                 }
                 ComposerBar(
@@ -458,17 +455,22 @@ private struct ConversationView: View {
         #endif
         #if os(macOS)
         .dropDestination(for: URL.self) { urls, _ in
-            guard isOnline, let url = urls.first else { return false }
-            model.stageFile(url)
+            guard isOnline, !urls.isEmpty else { return false }
+            model.stageFiles(urls)
             return true
         }
         #endif
         #if os(iOS)
         // Keep the presenter outside Menu: its content disappears after a choice.
-        .photosPicker(isPresented: $isChoosingPhoto, selection: $selectedPhoto, matching: .images)
-        .task(id: selectedPhoto) {
-            guard let selectedPhoto else { return }
-            await importPhoto(selectedPhoto)
+        .photosPicker(
+            isPresented: $isChoosingPhoto,
+            selection: $selectedPhotos,
+            maxSelectionCount: 10,
+            matching: .images
+        )
+        .task(id: selectedPhotos) {
+            guard !selectedPhotos.isEmpty else { return }
+            await importPhotos(selectedPhotos)
         }
         .alert("Could Not Load Photo", isPresented: Binding(
             get: { photoImportError != nil },
@@ -486,29 +488,42 @@ private struct ConversationView: View {
 
     #if os(iOS)
     @MainActor
-    private func importPhoto(_ item: PhotosPickerItem) async {
+    private func importPhotos(_ items: [PhotosPickerItem]) async {
         guard !Task.isCancelled else { return }
         isLoadingPhoto = true
-        photoLogger.notice("Photo selected; loading image data")
+        photoImportProgress = 0
+        photoLogger.notice("\(items.count, privacy: .public) photo(s) selected; loading image data")
         defer {
             // A cancelled load must not clear a newer selection or its progress.
-            if selectedPhoto == item {
+            if selectedPhotos == items {
                 isLoadingPhoto = false
-                selectedPhoto = nil
+                photoImportProgress = 0
+                selectedPhotos.removeAll()
             }
         }
-        do {
-            guard let data = try await item.loadTransferable(type: Data.self), !data.isEmpty else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            try Task.checkCancellation()
-            let contentType = item.supportedContentTypes.first { $0.conforms(to: .image) }
-            photoLogger.notice("Loaded photo data: \(data.count, privacy: .public) bytes")
-            model.stagePhotoData(data, contentType: contentType)
-        } catch {
+        var failures = 0
+        for (index, item) in items.enumerated() {
             guard !Task.isCancelled else { return }
-            photoLogger.error("Could not load selected photo: \(error.localizedDescription, privacy: .public)")
-            photoImportError = "\(error.localizedDescription) Please try selecting the photo again."
+            do {
+                guard let data = try await item.loadTransferable(type: Data.self), !data.isEmpty else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                try Task.checkCancellation()
+                let contentType = item.supportedContentTypes.first { $0.conforms(to: .image) }
+                photoLogger.notice("Loaded photo \(index + 1, privacy: .public)/\(items.count, privacy: .public): \(data.count, privacy: .public) bytes")
+                model.stagePhotoData(data, contentType: contentType)
+            } catch is CancellationError {
+                return
+            } catch {
+                failures += 1
+                photoLogger.error("Could not load selected photo: \(error.localizedDescription, privacy: .public)")
+            }
+            photoImportProgress = index + 1
+        }
+        if failures > 0 {
+            photoImportError = failures == 1
+                ? "One selected photo could not be loaded. Please try it again."
+                : "\(failures) selected photos could not be loaded. Please try them again."
         }
     }
     #endif
@@ -652,12 +667,12 @@ private struct ComposerBar: View {
             Menu {
                 #if os(iOS)
                 Button(action: choosePhoto) {
-                    Label("Choose Photo", systemImage: "photo")
+                    Label("Choose Photos (up to 10)", systemImage: "photo")
                 }
                 Divider()
                 #endif
                 Button(action: chooseFile) {
-                    Label("Choose File", systemImage: "doc")
+                    Label("Choose Files (up to 10)", systemImage: "doc")
                 }
             } label: {
                 Image(systemName: "paperclip")
@@ -665,7 +680,7 @@ private struct ComposerBar: View {
                 .frame(width: 40, height: 40)
                 .background(Color.primary.opacity(0.06), in: Circle())
             }
-            .accessibilityLabel("Attach photo or file")
+            .accessibilityLabel("Attach up to 10 photos or files")
             .disabled(!canSend)
 
             TextField(canSend ? "Write a message" : "Device is offline", text: $text, axis: .vertical)

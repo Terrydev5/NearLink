@@ -109,8 +109,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             val fileLauncher = rememberLauncherForActivityResult(
-                ActivityResultContracts.OpenDocument()
-            ) { uri -> uri?.let(model::stageFile) }
+                ActivityResultContracts.OpenMultipleDocuments()
+            ) { uris -> model.stageFiles(uris) }
             val context = LocalContext.current
 
             NearLinkTheme {
@@ -707,7 +707,7 @@ private fun MessageComposer(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             IconButton(onClick = onChooseFile, enabled = isOnline) {
-                Icon(Icons.Default.AttachFile, contentDescription = "Attach file", tint = NearLinkBlue)
+                Icon(Icons.Default.AttachFile, contentDescription = "Attach up to 10 files or photos", tint = NearLinkBlue)
             }
             TextField(
                 value = text,

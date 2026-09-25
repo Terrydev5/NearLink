@@ -47,7 +47,7 @@ All participants must run protocol version 2. Older builds are intentionally inc
 
 NearLink is an experimental local-network tool, not a secure messenger or a secure file vault. Control messages and file bytes are not yet encrypted, and devices are not yet paired or authenticated. Do not send private, confidential, or high-value data through NearLink.
 
-Android currently presents incoming file offers for user acceptance or rejection. The current Apple client starts receiving an offer automatically, so Apple users must treat every visible nearby peer as trusted.
+NearLink automatically starts receiving incoming file offers on Apple and Android. Use the app only with visible nearby peers you trust.
 
 Protocol version 2 adds a 256-bit, one-time token to every temporary file stream. The token expires after two minutes and prevents a client that lacks the offer from reading file bytes. It does not protect against an attacker who can observe or alter local-network traffic.
 

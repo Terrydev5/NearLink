@@ -28,6 +28,7 @@ import java.util.UUID
 private const val TAG = "NearLinkViewModel"
 private const val TRANSFER_TOKEN_TTL_MILLIS = 120_000L
 private const val DATA_CONNECTION_TIMEOUT_MILLIS = 10_000
+private const val MAXIMUM_BATCH_TRANSFER_COUNT = 10
 
 private fun persistentDeviceID(app: Application): UUID {
     val preferences = app.getSharedPreferences("nearlink", android.content.Context.MODE_PRIVATE)
@@ -172,6 +173,15 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun stageFiles(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        if (uris.size > MAXIMUM_BATCH_TRANSFER_COUNT) {
+            appendSystemMessage("Choose up to $MAXIMUM_BATCH_TRANSFER_COUNT files at a time")
+            return
+        }
+        uris.forEach(::stageFile)
+    }
+
     private fun queryFile(uri: Uri): FileMetadata {
         val resolver = getApplication<Application>().contentResolver
         var name = "Selected file"
@@ -289,7 +299,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
             }
             val dataHost = incomingDataHost(peerID, remoteHost)
             incomingTransfers[transfer.id] = IncomingTransfer(transfer, dataHost, sender)
-            Log.i(TAG, "Awaiting user approval for incoming ${transfer.fileName} (${transfer.id}), advertised size=${transfer.fileSize} bytes, data host=$dataHost")
+            Log.i(TAG, "Automatically accepting incoming ${transfer.fileName} (${transfer.id}), advertised size=${transfer.fileSize} bytes, data host=$dataHost")
+            acceptIncoming(transfer.id)
         }
     }
 
