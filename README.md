@@ -51,11 +51,11 @@ All participants must run protocol version 2. Older builds are intentionally inc
 
 NearLink is an experimental local-network tool, not a secure messenger or a secure file vault. Control messages and file bytes are not yet encrypted, and devices are not yet paired or authenticated. Do not send private, confidential, or high-value data through NearLink.
 
-NearLink automatically starts receiving incoming file offers on Apple and Android. Use the app only with visible nearby peers you trust.
+NearLink automatically checks incoming file offers on Apple and Android and receives those that pass validation and storage checks. Neither client asks for per-file approval. The discovery list and selected conversation are not access-control allowlists; use the app only on networks and with peers you trust.
 
 Each incoming file is limited to **2 GiB (2,147,483,648 bytes)**. Before accepting, the receiver checks free storage, reserves space for concurrent receives (at most ten), and keeps **512 MiB** free. It shows a notice if projected remaining space is below **2 GiB**, and rejects a file if space is insufficient. iOS also budgets for the extra Photos copy of received media. These checks use disk storage, not RAM.
 
-During reception, actual bytes may not exceed the advertised size; truncated streams and invalid SHA-256 digests fail. Free space is checked before each write. Apple and Android 8–9 use temporary files; newer Android uses pending MediaStore entries. Files become visible only after verification, and failed receive attempts clean up their temporary data.
+During reception, actual bytes may not exceed the advertised size; truncated streams and invalid SHA-256 digests fail. Free space is checked before each write. Apple and Android 8–9 use temporary files; newer Android uses pending MediaStore entries. Files become visible only after verification, and handled receive failures clean up their temporary data. Forced process termination and full interruption recovery are not covered by that guarantee.
 
 Protocol version 2 adds a 256-bit, one-time token to every temporary file stream. The token expires after two minutes and prevents a client that lacks the offer from reading file bytes. It does not protect against an attacker who can observe or alter local-network traffic.
 
@@ -65,9 +65,12 @@ See [Privacy and security](docs/privacy.md) for the data stored locally, permiss
 
 ## Roadmap
 
-- Add automated cross-platform protocol test vectors and continuous integration.
+- Expand the existing ACK contract and transfer-safety tests into broader cross-platform protocol coverage, add continuous integration, and record reproducible real-device validation results.
+- Make sender completion depend on receiver confirmation, refresh Android connection endpoints after rediscovery, and persist the actual received-file location on Apple clients.
 - Improve cancellation, resuming, and recovery after interrupted transfers.
 - Add verified device pairing, then encrypt and authenticate control and file transports before recommending NearLink for sensitive content.
+
+These roadmap items are not completed features. In particular, Android sender success can currently precede receiver verification, and token expiry does not guarantee complete transfer cleanup. See [protocol implementation limitations](docs/protocol.md#implementation-limitations).
 
 ## Contributing
 

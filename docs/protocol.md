@@ -25,7 +25,7 @@ Every WebSocket message is UTF-8 JSON with this shape. `timestamp` is Unix time 
 }
 ```
 
-Supported message types are `hello`, `text_message`, `file_offer`, `file_accept`, `file_reject`, `transfer_start`, `transfer_progress`, `transfer_complete`, `transfer_cancel`, `heartbeat`, `heartbeat_ack`, `ack`, and `error`.
+The protocol defines `hello`, `text_message`, `file_offer`, `file_accept`, `file_reject`, `transfer_start`, `transfer_progress`, `transfer_complete`, `transfer_cancel`, `heartbeat`, `heartbeat_ack`, `ack`, and `error`. A defined message type does not imply that both clients implement its full lifecycle; see the implementation limitations below.
 
 `hello.payload.device` includes `id`, `name`, `platform`, and `protocolVersion`. A text message uses `payload.text` and may include `payload.senderID` so a receiver can identify its peer while the initial hello frame is still being handled.
 
@@ -33,17 +33,24 @@ Supported message types are `hello`, `text_message`, `file_offer`, `file_accept`
 
 1. The sender calculates the file's SHA-256 digest, opens a temporary TCP listener, generates a random one-time token, and sends `file_offer`.
 2. `file_offer.payload.transfer` contains `id`, `fileName`, `fileSize`, `checksum`, optional `mimeType`, `streamPort`, `streamToken`, and `streamTokenExpiresAt`.
-3. The receiver accepts with `file_accept` or declines with `file_reject`. Both carry `transferID` and `receivedBytes`.
-4. Before the receiver reads file bytes from the TCP connection, it sends the ASCII stream token followed by a newline (`\n`). The sender serves only an authenticated client.
-5. The receiver writes the stream in 256 KiB chunks, calculates SHA-256, and rejects the result if it differs from `checksum`. A successful receiver sends `transfer_complete`.
+3. Both clients automatically evaluate offers; they do not prompt for per-file approval. The receiver accepts with `file_accept` after validation and storage checks, or uses `file_reject` for handled rejections. Both messages carry `transferID` and `receivedBytes`. Malformed or undecodable offers can be dropped before this decision path.
+4. Before the receiver reads file bytes from the TCP connection, it sends the ASCII stream token followed by a newline (`\n`). This authorizes the data connection with a bearer token; it does not verify the peer's identity.
+5. The receiver writes the stream in chunks of up to 256 KiB, verifies its exact byte count and SHA-256 digest, and only then publishes the file. A successful receiver attempts to send `transfer_complete` over the control connection.
 
 Both clients reject incoming offers with negative sizes or sizes above 2 GiB (2,147,483,648 bytes), malformed SHA-256 digests, insufficient free storage, or more than ten concurrent receives. Admission accounts for other active receives and a 512 MiB free-space reserve. A receiver warns locally when projected remaining storage is below 2 GiB. iOS also reserves room for an automatic Photos copy where applicable.
 
-The data stream must contain exactly `fileSize` bytes. Receivers reject excess bytes before writing them, reject premature EOF, and verify the digest before publishing the file. Failures remove partial files/pending media and send `file_reject` when the control connection is available. Receive limits are local policy and do not change protocol version 2.
+The data stream must contain exactly `fileSize` bytes. Receivers reject excess bytes before writing them, reject premature EOF, and verify the digest before publishing the file. Handled failures remove partial files/pending media and attempt to send `file_reject` when the control connection is available. This cleanup is not a guarantee of recovery after forced process termination. Receive limits are local policy and do not change protocol version 2.
 
 ACK frames use the complete control envelope, including a fresh `messageID` and millisecond `timestamp`. `payload.messageID` identifies the acknowledged message.
 
 Tokens are URL-safe, 256-bit random values and expire after two minutes in the current implementation. They authenticate the temporary data connection; they do **not** encrypt control messages or file contents.
+
+## Implementation limitations
+
+- `file_accept` reflects an automatic receiver decision, not explicit user approval. A low-storage alert is informational and does not serve as approval.
+- `transfer_complete` is the receiver's completion signal, but the Android sender currently also marks a transfer complete when its local socket write finishes. Its displayed success does not yet guarantee that the receiver verified and saved the file. On iOS, the completion signal currently follows the optional Photos-saving step, which can delay the receipt.
+- `transfer_cancel` exists in the protocol, but cancellation does not yet consistently stop established data sockets and all related tasks. Two-minute token expiry does not imply a transfer-wide timeout or complete resource cleanup; in particular, an unanswered Android file offer can retain its listener.
+- Interrupted-transfer recovery and byte-range resumption are not implemented. The current transfer flow starts at byte zero; `receivedBytes` in decision messages is not evidence of resumable transfer support.
 
 ## Compatibility and change policy
 
