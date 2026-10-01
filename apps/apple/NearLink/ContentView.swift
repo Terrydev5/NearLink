@@ -36,6 +36,14 @@ struct ContentView: View {
             }
         }
         .task { model.start() }
+        .alert("File reception", isPresented: Binding(
+            get: { model.incomingStorageNotice != nil },
+            set: { if !$0 { model.incomingStorageNotice = nil } }
+        )) {
+            Button("OK", role: .cancel) { model.incomingStorageNotice = nil }
+        } message: {
+            Text(model.incomingStorageNotice ?? "")
+        }
         #if os(macOS)
         .onDisappear { model.stop() }
         #endif
@@ -377,6 +385,8 @@ private struct ConversationView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 12)
             }
+            // Dismiss through the scroll view or the field's Done key. A separate
+            // keyboard toolbar can float over the bottom-inset send button on iOS.
             .scrollDismissesKeyboard(.interactively)
             .contentShape(Rectangle())
             .onTapGesture {
@@ -443,16 +453,6 @@ private struct ConversationView: View {
                 DeviceStatusBadge(isOnline: isOnline)
             }
         }
-        #if os(iOS)
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("Done") {
-                    isComposerFocused = false
-                }
-            }
-        }
-        #endif
         #if os(macOS)
         .dropDestination(for: URL.self) { urls, _ in
             guard isOnline, !urls.isEmpty else { return false }

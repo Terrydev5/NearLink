@@ -23,10 +23,12 @@ class NearbyDiscovery(context: Context, private val localDevice: NearbyDevice) {
     private val devices = linkedMapOf<UUID, NearbyDevice>()
 
     fun start(onChanged: (List<NearbyDevice>) -> Unit, onStatus: (String) -> Unit = {}) {
+        NearLinkDiagnostics.event("NSD start requested")
         onDevicesChanged = onChanged
         onStatusChanged = onStatus
         multicastLock.setReferenceCounted(false)
         multicastLock.acquire()
+        NearLinkDiagnostics.event("NSD multicast lock acquired")
         val serviceInfo = NsdServiceInfo().apply {
             serviceName = localName
             serviceType = NearLinkProtocol.SERVICE_TYPE
@@ -38,22 +40,27 @@ class NearbyDiscovery(context: Context, private val localDevice: NearbyDevice) {
         registration = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(info: NsdServiceInfo) {
                 localName = info.serviceName
+                NearLinkDiagnostics.event("NSD service registered")
                 onStatusChanged("Advertising as ${info.serviceName}")
             }
             override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {
+                NearLinkDiagnostics.event("NSD service registration failed: code=$errorCode")
                 onStatusChanged("Could not advertise service ($errorCode)")
             }
             override fun onServiceUnregistered(info: NsdServiceInfo) = Unit
             override fun onUnregistrationFailed(info: NsdServiceInfo, errorCode: Int) = Unit
         }
+        NearLinkDiagnostics.event("Registering NSD service")
         nsd.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registration)
 
         discovery = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {
+                NearLinkDiagnostics.event("NSD discovery started")
                 onStatusChanged("Searching nearby devices")
             }
             override fun onDiscoveryStopped(serviceType: String) = Unit
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                NearLinkDiagnostics.event("NSD discovery start failed: code=$errorCode")
                 onStatusChanged("Discovery failed ($errorCode)")
             }
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = Unit
@@ -95,10 +102,12 @@ class NearbyDiscovery(context: Context, private val localDevice: NearbyDevice) {
                 onDevicesChanged(devices.values.sortedBy { it.name })
             }
         }
+        NearLinkDiagnostics.event("Starting NSD discovery")
         nsd.discoverServices(NearLinkProtocol.SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discovery)
     }
 
     fun stop() {
+        NearLinkDiagnostics.event("Stopping NSD discovery")
         discovery?.let { runCatching { nsd.stopServiceDiscovery(it) } }
         registration?.let { runCatching { nsd.unregisterService(it) } }
         discovery = null

@@ -5,10 +5,10 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.StatFs
 import android.provider.MediaStore
 import java.io.File
 import java.io.InputStream
-import java.security.MessageDigest
 
 data class SavedFile(
     val uri: Uri,
@@ -19,19 +19,33 @@ data class SavedFile(
 class NearLinkFileStorage(context: Context) {
     private val appContext = context.applicationContext
 
+    fun availableBytes(): Long {
+        val directory = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Environment.getExternalStorageDirectory()
+        } else {
+            requireNotNull(appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)) {
+                "Download storage is unavailable"
+            }
+        }
+        return StatFs(directory.absolutePath).availableBytes
+    }
+
     fun saveReceivedFile(
         fileName: String,
         mimeType: String?,
         input: InputStream,
         expectedBytes: Long,
+        expectedChecksum: String,
         onProgress: (Long) -> Unit
     ): SavedFile {
-        val safeName = fileName.substringAfterLast('/').substringAfterLast('\\').ifBlank { "NearLink-file" }
+        IncomingFilePolicy.validateOffer(expectedBytes, expectedChecksum)
+        val safeName = fileName.substringAfterLast('/').substringAfterLast('\\')
+            .takeUnless { it.isBlank() || it == "." || it == ".." } ?: "NearLink-file"
         val resolvedMime = mimeType ?: guessMimeType(safeName)
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            saveWithMediaStore(safeName, resolvedMime, input, expectedBytes, onProgress)
+            saveWithMediaStore(safeName, resolvedMime, input, expectedBytes, expectedChecksum, onProgress)
         } else {
-            saveToAppExternalFiles(safeName, resolvedMime, input, expectedBytes, onProgress)
+            saveToAppExternalFiles(safeName, input, expectedBytes, expectedChecksum, onProgress)
         }
     }
 
@@ -40,6 +54,7 @@ class NearLinkFileStorage(context: Context) {
         mimeType: String,
         input: InputStream,
         expectedBytes: Long,
+        expectedChecksum: String,
         onProgress: (Long) -> Unit
     ): SavedFile {
         val resolver = appContext.contentResolver
@@ -58,13 +73,13 @@ class NearLinkFileStorage(context: Context) {
         val uri = resolver.insert(collection, values)
             ?: error("Could not create a destination in the media library")
         try {
-            resolver.openOutputStream(uri)?.use { output ->
-                val checksum = copyAndHash(input, output, expectedBytes, onProgress)
-                resolver.update(uri, ContentValues().apply {
-                    put(MediaStore.MediaColumns.IS_PENDING, 0)
-                }, null, null)
-                return SavedFile(uri, checksum)
+            val checksum = resolver.openOutputStream(uri)?.use { output ->
+                VerifiedFileCopy.copy(input, output, expectedBytes, expectedChecksum, ::availableBytes, onProgress)
             } ?: error("Could not open the media library destination")
+            check(resolver.update(uri, ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }, null, null) == 1) { "Could not publish the verified file" }
+            return SavedFile(uri, checksum)
         } catch (error: Throwable) {
             resolver.delete(uri, null, null)
             throw error
@@ -73,55 +88,21 @@ class NearLinkFileStorage(context: Context) {
 
     private fun saveToAppExternalFiles(
         fileName: String,
-        mimeType: String,
         input: InputStream,
         expectedBytes: Long,
+        expectedChecksum: String,
         onProgress: (Long) -> Unit
     ): SavedFile {
         val directory = File(
-            appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
+            requireNotNull(appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)) {
+                "Download storage is unavailable"
+            },
             "NearLink/Received"
         ).apply { mkdirs() }
-        val destination = uniqueFile(directory, fileName)
-        return try {
-            destination.outputStream().use { output ->
-                val checksum = copyAndHash(input, output, expectedBytes, onProgress)
-                SavedFile(Uri.fromFile(destination), checksum)
-            }
-        } catch (error: Throwable) {
-            destination.delete()
-            throw error
-        }
-    }
-
-    private fun copyAndHash(
-        input: InputStream,
-        output: java.io.OutputStream,
-        expectedBytes: Long,
-        onProgress: (Long) -> Unit
-    ): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        val buffer = ByteArray(NearLinkProtocol.CHUNK_SIZE)
-        var completed = 0L
-        while (true) {
-            val count = input.read(buffer)
-            if (count <= 0) break
-            output.write(buffer, 0, count)
-            digest.update(buffer, 0, count)
-            completed += count
-            onProgress(completed.coerceAtMost(expectedBytes))
-        }
-        output.flush()
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
-
-    private fun uniqueFile(directory: File, fileName: String): File {
-        val original = File(directory, fileName)
-        if (!original.exists()) return original
-        val stem = original.nameWithoutExtension
-        val extension = original.extension
-        val suffix = System.currentTimeMillis()
-        return File(directory, if (extension.isEmpty()) "$stem-$suffix" else "$stem-$suffix.$extension")
+        val (destination, checksum) = VerifiedFileCopy.saveToFile(
+            directory, fileName, input, expectedBytes, expectedChecksum, ::availableBytes, onProgress
+        )
+        return SavedFile(Uri.fromFile(destination), checksum)
     }
 
     private fun guessMimeType(fileName: String): String {

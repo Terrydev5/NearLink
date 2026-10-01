@@ -23,6 +23,7 @@ final class NearLinkAppModel: ObservableObject {
         }
     }
     @Published var messageText = ""
+    @Published var incomingStorageNotice: String?
     @Published private(set) var messages: [String] = []
 
     private let discovery = BonjourDiscoveryActor(localDevice: .local)
@@ -39,6 +40,7 @@ final class NearLinkAppModel: ObservableObject {
     private var outboundFileServers: [UUID: OutboundFileServer] = [:]
     private var outboundFileAccess: [UUID: OutgoingFileAccess] = [:]
     private var incomingOffers: [UUID: IncomingOffer] = [:]
+    private var incomingStorageReservations: [UUID: Int64] = [:]
     private var transferFileURLs: [UUID: URL] = [:]
     private var transferPeerIDs: [UUID: UUID] = [:]
     private let logger = Logger(subsystem: "cn.terrydev.NearLink", category: "lifecycle")
@@ -293,36 +295,58 @@ final class NearLinkAppModel: ObservableObject {
         guard let offer = incomingOffers[transferID] else { return }
         Task { [weak self] in
             guard let self else { return }
+            guard incomingStorageReservations[transferID] == nil else { return }
+            defer { incomingStorageReservations.removeValue(forKey: transferID) }
+            do {
+                try IncomingFilePolicy.validateOffer(byteCount: offer.descriptor.fileSize, checksum: offer.descriptor.checksum)
+                guard incomingStorageReservations.count < IncomingFilePolicy.maximumConcurrentReceives else {
+                    throw IncomingFilePolicy.failure("Too many files are being received. Please ask the sender to retry later.")
+                }
+                let destination = try receivedFileURL(for: offer.descriptor.fileName)
+                var requiredBytes = offer.descriptor.fileSize
+                #if os(iOS)
+                // Auto-saving media to Photos may create a second on-device copy.
+                if let type = UTType(filenameExtension: destination.pathExtension),
+                   type.conforms(to: .image) || type.conforms(to: .movie) {
+                    requiredBytes += offer.descriptor.fileSize
+                }
+                #endif
+                let reservedBytes = incomingStorageReservations.values.reduce(0, +)
+                let available = try IncomingFilePolicy.availableBytes(at: destination.deletingLastPathComponent())
+                if let warning = try IncomingFilePolicy.checkCapacity(requiredBytes: requiredBytes, availableBytes: available, reservedBytes: reservedBytes) {
+                    incomingStorageNotice = warning
+                }
+                incomingStorageReservations[transferID] = requiredBytes
+                let reservationBytes = requiredBytes
                 guard let port = offer.descriptor.streamPort,
                       let streamToken = offer.descriptor.streamToken,
                       let tokenExpiresAt = offer.descriptor.streamTokenExpiresAt,
+                      TransferToken.isValid(streamToken), tokenExpiresAt >= Date(),
                       let host = await offer.connection.remoteHost() else {
-                    await failIncomingTransfer(transferID, reason: "The sender did not provide an authorized file stream.")
-                return
-            }
-            do {
+                    throw IncomingFilePolicy.failure("The sender did not provide an authorized file stream.")
+                }
                 _ = try await transferActor.transition(transferID, to: .transferring)
                 transfers = await transferActor.allSnapshots()
                 try await offer.connection.send(NearLinkEnvelope(
                     type: .fileAccept,
                     payload: TransferDecisionPayload(transferID: transferID, receivedBytes: 0)
                 ))
-                let destination = try receivedFileURL(for: offer.descriptor.fileName)
                 let receiver = InboundFileReceiver()
                 let fileURL = try await receiver.receive(
                     from: host,
                     port: port,
                     into: destination,
                     streamToken: streamToken,
-                    tokenExpiresAt: tokenExpiresAt
+                    tokenExpiresAt: tokenExpiresAt,
+                    expectedBytes: offer.descriptor.fileSize,
+                    expectedChecksum: offer.descriptor.checksum
                 ) { [weak self] completedBytes in
                     Task { @MainActor in
+                        if self?.incomingStorageReservations[transferID] != nil {
+                            self?.incomingStorageReservations[transferID] = max(0, reservationBytes - completedBytes)
+                        }
                         await self?.updateTransferProgress(transferID, completedBytes: completedBytes)
                     }
-                }
-                let checksum = try FileHasher.sha256(of: fileURL)
-                guard checksum == offer.descriptor.checksum else {
-                    throw NearLinkError.checksumMismatch
                 }
                 _ = await transferActor.updateProgress(transferID, completedBytes: offer.descriptor.fileSize)
                 _ = try await transferActor.transition(transferID, to: .completed)
@@ -340,6 +364,11 @@ final class NearLinkAppModel: ObservableObject {
                     payload: TransferDecisionPayload(transferID: transferID, receivedBytes: offer.descriptor.fileSize)
                 ))
             } catch {
+                incomingStorageNotice = "Could not receive \(offer.descriptor.fileName). \(error.localizedDescription)"
+                try? await offer.connection.send(NearLinkEnvelope(
+                    type: .fileReject,
+                    payload: TransferDecisionPayload(transferID: transferID, receivedBytes: 0)
+                ))
                 await failIncomingTransfer(transferID, reason: error.localizedDescription)
             }
         }
@@ -398,11 +427,13 @@ final class NearLinkAppModel: ObservableObject {
             }
         case .fileOffer:
             guard let envelope = try? ProtocolCodec().decode(NearLinkEnvelope<FileOfferPayload>.self, from: data) else { return }
+            guard incomingOffers[envelope.payload.transfer.id] == nil,
+                  !transfers.contains(where: { $0.id == envelope.payload.transfer.id }) else { return }
+            incomingOffers[envelope.payload.transfer.id] = IncomingOffer(descriptor: envelope.payload.transfer, connection: connection)
             Task { @MainActor in
                 _ = await transferActor.registerIncoming(envelope.payload.transfer)
                 logger.info("Received file offer \(envelope.payload.transfer.fileName, privacy: .public)")
                 transfers = await transferActor.allSnapshots()
-                incomingOffers[envelope.payload.transfer.id] = IncomingOffer(descriptor: envelope.payload.transfer, connection: connection)
                 if let peerID = connectionPeerIDs[ObjectIdentifier(connection)] {
                     transferPeerIDs[envelope.payload.transfer.id] = peerID
                     appendTransferItem(envelope.payload.transfer.id, peerID: peerID, isIncoming: true)
@@ -871,6 +902,17 @@ final class NearLinkAppModel: ObservableObject {
             authorization = .denied
         }
         guard authorization == .authorized || authorization == .limited else { return }
+
+        do {
+            let size = try fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            _ = try IncomingFilePolicy.checkCapacity(
+                requiredBytes: Int64(size),
+                availableBytes: IncomingFilePolicy.availableBytes(at: fileURL.deletingLastPathComponent())
+            )
+        } catch {
+            incomingStorageNotice = "The verified file was saved in Files, but could not be copied to Photos. \(error.localizedDescription)"
+            return
+        }
 
         await withCheckedContinuation { continuation in
             PHPhotoLibrary.shared().performChanges({

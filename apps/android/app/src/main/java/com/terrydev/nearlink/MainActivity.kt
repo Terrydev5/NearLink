@@ -102,11 +102,13 @@ class MainActivity : ComponentActivity() {
     private val nearbyPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
+        NearLinkDiagnostics.event("Nearby-device permission result: granted=$granted")
         if (granted) model.start()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        NearLinkDiagnostics.event("MainActivity.onCreate; restoring=${savedInstanceState != null}")
         setContent {
             val fileLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenMultipleDocuments()
@@ -114,6 +116,16 @@ class MainActivity : ComponentActivity() {
             val context = LocalContext.current
 
             NearLinkTheme {
+                model.incomingStorageNotice.value?.let { notice ->
+                    AlertDialog(
+                        onDismissRequest = { model.incomingStorageNotice.value = null },
+                        title = { Text("File reception") },
+                        text = { Text(notice) },
+                        confirmButton = {
+                            Button(onClick = { model.incomingStorageNotice.value = null }) { Text("OK") }
+                        }
+                    )
+                }
                 NearLinkScreen(
                     model = model,
                     chooseFile = { fileLauncher.launch(arrayOf("*/*")) },
@@ -138,8 +150,10 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.ACCESS_FINE_LOCATION
         }
         if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
+            NearLinkDiagnostics.event("Requesting nearby-device permission: $permission")
             nearbyPermissionLauncher.launch(permission)
         } else {
+            NearLinkDiagnostics.event("Nearby-device permission already granted: $permission")
             model.start()
         }
     }

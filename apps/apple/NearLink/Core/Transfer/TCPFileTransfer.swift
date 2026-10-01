@@ -111,9 +111,11 @@ actor InboundFileReceiver {
         into destinationURL: URL,
         streamToken: String,
         tokenExpiresAt: Date,
-        resumeAt offset: Int64 = 0,
+        expectedBytes: Int64,
+        expectedChecksum: String,
         progressHandler: @escaping @Sendable (Int64) -> Void = { _ in }
     ) async throws -> URL {
+        try IncomingFilePolicy.validateOffer(byteCount: expectedBytes, checksum: expectedChecksum)
         guard TransferToken.isValid(streamToken) else {
             throw NearLinkError.connectionFailed("Missing transfer authorization token")
         }
@@ -126,32 +128,21 @@ actor InboundFileReceiver {
         let parameters = NWParameters.tcp
         parameters.includePeerToPeer = true
         let connection = NWConnection(host: host, port: endpointPort, using: parameters)
+        defer { connection.cancel() }
         try await waitUntilReady(connection)
         try await send(Data((streamToken + "\n").utf8), on: connection, isComplete: false)
-
-        let fileManager = FileManager.default
-        if offset == 0, fileManager.fileExists(atPath: destinationURL.path) {
-            try fileManager.removeItem(at: destinationURL)
-        }
-        if !fileManager.fileExists(atPath: destinationURL.path) {
-            _ = fileManager.createFile(atPath: destinationURL.path, contents: nil)
-        }
-        let handle = try FileHandle(forWritingTo: destinationURL)
-        defer {
-            try? handle.close()
-            connection.cancel()
-        }
-        try handle.seek(toOffset: UInt64(offset))
-        var completedBytes = offset
+        let writer = try VerifiedIncomingFile(destination: destinationURL, expectedBytes: expectedBytes,
+                                              expectedChecksum: expectedChecksum)
+        defer { writer.discard() }
 
         while true {
+            try Task.checkCancellation()
             let received = try await receiveChunk(on: connection)
             if let data = received.data, !data.isEmpty {
-                try handle.write(contentsOf: data)
-                completedBytes += Int64(data.count)
-                progressHandler(completedBytes)
+                try writer.append(data)
+                progressHandler(writer.completedBytes)
             }
-            if received.isComplete { return destinationURL }
+            if received.isComplete { return try writer.finish() }
         }
     }
 }

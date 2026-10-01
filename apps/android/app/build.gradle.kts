@@ -46,4 +46,6 @@ dependencies {
     implementation("io.ktor:ktor-server-cio:2.3.12")
     implementation("io.ktor:ktor-server-websockets:2.3.12")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

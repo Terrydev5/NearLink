@@ -37,6 +37,12 @@ Supported message types are `hello`, `text_message`, `file_offer`, `file_accept`
 4. Before the receiver reads file bytes from the TCP connection, it sends the ASCII stream token followed by a newline (`\n`). The sender serves only an authenticated client.
 5. The receiver writes the stream in 256 KiB chunks, calculates SHA-256, and rejects the result if it differs from `checksum`. A successful receiver sends `transfer_complete`.
 
+Both clients reject incoming offers with negative sizes or sizes above 2 GiB (2,147,483,648 bytes), malformed SHA-256 digests, insufficient free storage, or more than ten concurrent receives. Admission accounts for other active receives and a 512 MiB free-space reserve. A receiver warns locally when projected remaining storage is below 2 GiB. iOS also reserves room for an automatic Photos copy where applicable.
+
+The data stream must contain exactly `fileSize` bytes. Receivers reject excess bytes before writing them, reject premature EOF, and verify the digest before publishing the file. Failures remove partial files/pending media and send `file_reject` when the control connection is available. Receive limits are local policy and do not change protocol version 2.
+
+ACK frames use the complete control envelope, including a fresh `messageID` and millisecond `timestamp`. `payload.messageID` identifies the acknowledged message.
+
 Tokens are URL-safe, 256-bit random values and expire after two minutes in the current implementation. They authenticate the temporary data connection; they do **not** encrypt control messages or file contents.
 
 ## Compatibility and change policy

@@ -34,6 +34,14 @@ fun historicalDevice(id: UUID): NearbyDevice = NearbyDevice(
 )
 
 object Envelope {
+    fun acknowledgement(messageID: String): String = JSONObject()
+        .put("version", NearLinkProtocol.VERSION)
+        .put("type", "ack")
+        .put("messageID", UUID.randomUUID().toString())
+        .put("timestamp", System.currentTimeMillis())
+        .put("payload", JSONObject().put("messageID", messageID))
+        .toString()
+
     fun hello(device: NearbyDevice): String = JSONObject()
         .put("version", NearLinkProtocol.VERSION)
         .put("type", "hello")

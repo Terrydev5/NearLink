@@ -48,6 +48,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     val selectedDevice = mutableStateOf<NearbyDevice?>(null)
     val draft = mutableStateOf("")
     val discoveryStatus = mutableStateOf("Starting discovery…")
+    val incomingStorageNotice = mutableStateOf<String?>(null)
 
     val localDeviceName: String
         get() = local.name
@@ -74,18 +75,24 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     }
     private val outgoingTransfers = mutableMapOf<UUID, OutgoingTransfer>()
     private val incomingTransfers = mutableMapOf<UUID, IncomingTransfer>()
+    // Main-thread-only admission budget; counts bytes not yet written by other receives.
+    private val incomingStorageReservations = mutableMapOf<UUID, Long>()
     private val sessionPeerIDs = mutableMapOf<String, UUID>()
     private var started = false
 
     init {
+        NearLinkDiagnostics.event("NearLinkViewModel created; restoring local history")
         restoreConversationHistory()
+        NearLinkDiagnostics.event("Local history restoration completed")
     }
 
     fun start() {
         if (started) return
         started = true
         Log.i(TAG, "Starting Nearby discovery as ${local.name} (${local.id})")
+        NearLinkDiagnostics.event("Starting local control server on port ${NearLinkProtocol.PORT}")
         server.start()
+        NearLinkDiagnostics.event("Local control server start returned; starting NSD")
         discovery.start(
             onChanged = { found ->
                 viewModelScope.launch(Dispatchers.Main) {
@@ -94,6 +101,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
             },
             onStatus = { status -> discoveryStatus.value = status }
         )
+        NearLinkDiagnostics.event("NSD start returned")
     }
 
     fun stageFile(uri: Uri) {
@@ -113,8 +121,10 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
             var transferID: UUID? = null
             var serverSocket: ServerSocket? = null
             try {
-                val metadata = queryFile(uri)
-                val checksum = sha256(uri)
+                val queriedMetadata = queryFile(uri)
+                val (checksum, byteCount) = sha256AndByteCount(uri)
+                // Providers can report SIZE as null or stale; receivers enforce exact size.
+                val metadata = queriedMetadata.copy(size = byteCount)
                 val streamToken = TransferToken.generate()
                 val streamTokenExpiresAt = System.currentTimeMillis() + TRANSFER_TOKEN_TTL_MILLIS
                 transferID = UUID.randomUUID()
@@ -200,8 +210,9 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         return FileMetadata(name, size, resolver.getType(uri))
     }
 
-    private fun sha256(uri: Uri): String {
+    private fun sha256AndByteCount(uri: Uri): Pair<String, Long> {
         val digest = MessageDigest.getInstance("SHA-256")
+        var byteCount = 0L
         getApplication<Application>().contentResolver.openInputStream(uri).use { input ->
             requireNotNull(input) { "Could not open selected file" }
             val buffer = ByteArray(NearLinkProtocol.CHUNK_SIZE)
@@ -209,9 +220,10 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
                 val count = input.read(buffer)
                 if (count <= 0) break
                 digest.update(buffer, 0, count)
+                byteCount += count
             }
         }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+        return digest.digest().joinToString("") { "%02x".format(it) } to byteCount
     }
 
     private fun handleControlMessage(
@@ -310,11 +322,29 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         updateTransferProgress(transferID, 0, TransferStatus.RECEIVING)
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                withContext(Dispatchers.Main) {
+                    IncomingFilePolicy.validateOffer(incoming.transfer.fileSize, incoming.transfer.checksum)
+                    check(incomingStorageReservations.size < IncomingFilePolicy.MAXIMUM_CONCURRENT_RECEIVES) {
+                        "Too many files are being received. Please ask the sender to retry later."
+                    }
+                    IncomingFilePolicy.checkCapacity(
+                        incoming.transfer.fileSize, storage.availableBytes(), incomingStorageReservations.values.sum()
+                    )?.let { incomingStorageNotice.value = it }
+                    incomingStorageReservations[transferID] = incoming.transfer.fileSize
+                }
                 incoming.sender(Envelope.fileAccept(transferID))
                 receiveIncoming(incoming.transfer, incoming.remoteHost, incoming.sender)
             } catch (error: Exception) {
                 Log.w(TAG, "Incoming transfer failed: $transferID", error)
+                withContext(Dispatchers.Main) {
+                    incomingStorageNotice.value = "Could not receive ${incoming.transfer.fileName}. ${error.localizedMessage ?: "Please try again."}"
+                }
+                runCatching { incoming.sender(Envelope.fileReject(transferID)) }
                 markTransferFailed(transferID, error.localizedMessage ?: "unknown error")
+            } finally {
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main) {
+                    incomingStorageReservations.remove(transferID)
+                }
             }
         }
     }
@@ -351,15 +381,14 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
                     transfer.fileName,
                     transfer.mimeType,
                     input,
-                    transfer.fileSize
+                    transfer.fileSize,
+                    transfer.checksum
                 ) { completedBytes ->
                     updateTransferProgress(transfer.id, completedBytes, TransferStatus.RECEIVING)
                 }
-                require(saved.checksum.equals(transfer.checksum, ignoreCase = true)) {
-                    "The received file failed SHA-256 verification"
-                }
                 updateTransferProgress(transfer.id, transfer.fileSize, TransferStatus.COMPLETED, saved.uri)
-                sendControl(Envelope.fileComplete(transfer.id, transfer.fileSize))
+                // Verification and publication succeeded; losing the receipt must not undo them.
+                runCatching { sendControl(Envelope.fileComplete(transfer.id, transfer.fileSize)) }
             }
         }
     }
@@ -525,6 +554,9 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         viewModelScope.launch(Dispatchers.Main) {
             transfers[transferID]?.let { current ->
+                if (incomingStorageReservations.containsKey(transferID)) {
+                    incomingStorageReservations[transferID] = (current.fileSize - completedBytes).coerceAtLeast(0)
+                }
                 upsertTransfer(
                     current.copy(
                         completedBytes = completedBytes.coerceAtMost(current.fileSize),
@@ -532,6 +564,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
                         localUri = localUri ?: current.localUri
                     )
                 )
+                if (status == TransferStatus.COMPLETED) persistConversationHistory()
             }
         }
     }
@@ -684,6 +717,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        NearLinkDiagnostics.event("NearLinkViewModel cleared; stopping discovery, transport, and server")
         discovery.stop()
         transport.close()
         server.stop()
@@ -724,6 +758,9 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         if (timeline.isNotEmpty() || transfers.isNotEmpty()) {
             Log.d(TAG, "Restored ${timeline.size} conversation item(s), ${transfers.size} transfer(s), and ${unreadMessageCounts.size} unread conversation(s)")
         }
+        NearLinkDiagnostics.event(
+            "Restored history: ${timeline.size} timeline item(s), ${transfers.size} transfer(s), ${knownDevices.size} known device(s)"
+        )
         if (interruptedTransferCount > 0) persistConversationHistory()
     }
 
