@@ -9,6 +9,7 @@ import SwiftUI
 
 @main
 struct NearLinkApp: App {
+    // 应用入口持有共享状态；子视图通过 environmentObject 读取，生命周期事件交给 model。
     @StateObject private var model = NearLinkAppModel()
     @Environment(\.scenePhase) private var scenePhase
 

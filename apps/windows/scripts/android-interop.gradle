@@ -1,0 +1,7 @@
+// Opt-in test source set: leaves the Android production project unchanged.
+def windowsTests = new File(gradle.startParameter.initScripts.find { it.name == 'android-interop.gradle' }.parentFile, '../Tests/Android')
+gradle.beforeProject { project ->
+    project.plugins.withId('com.android.application') {
+        project.android.sourceSets.getByName('test').java.srcDir(windowsTests)
+    }
+}

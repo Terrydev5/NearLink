@@ -12,7 +12,7 @@ Thanks for considering a contribution.
 
 1. Create a focused branch from `main`.
 2. Keep each pull request limited to one problem or feature.
-3. Include build/test evidence and list the Apple/Android devices or OS versions used when networking behavior changes. For file protocol changes, test successful transfer, unauthorised stream rejection, token expiry, checksum failure, and cancellation where applicable.
+3. Include build/test evidence and list the iOS/macOS/Android/Windows devices or OS versions used when networking behavior changes. Distinguish portable core and codec tests from native builds and real-device networking. For file protocol changes, test successful transfer, unauthorised stream rejection, token expiry, checksum failure, and cancellation where applicable.
 4. Do not commit private keys, provisioning profiles, real configuration files, received user files, or build outputs.
 5. Explain any user-visible change and update documentation where needed.
 6. Report potential vulnerabilities privately as described in [SECURITY.md](SECURITY.md), rather than opening a public issue.

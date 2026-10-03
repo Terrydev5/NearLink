@@ -23,6 +23,7 @@ class NearLinkTransport(
         sendRaw(device, Envelope.text(text, localDevice.id))
     }
 
+    // OkHttp send 的布尔值只表示是否入队；这个方法不等待远端接收或处理确认。
     fun sendRaw(device: NearbyDevice, message: String) {
         val existing = sockets[device.id]
         if (existing != null && existing.send(message)) {

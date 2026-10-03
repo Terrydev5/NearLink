@@ -7,6 +7,8 @@ import UniformTypeIdentifiers
 import Photos
 #endif
 
+// 业务编排入口：把界面操作、发现结果、网络消息转换成可观察状态。
+// UI 状态由 MainActor 隔离；网络连接、文件流和传输状态分别委托给 Core 中的 actor。
 @MainActor
 final class NearLinkAppModel: ObservableObject {
     private static let maximumBatchTransferCount = 10
@@ -105,6 +107,7 @@ final class NearLinkAppModel: ObservableObject {
         }
     }
 
+    // 两条独立事件流：设备列表变化，以及对端主动建立的 WebSocket 控制连接。
     func start() {
         guard discoveryTask == nil, discoveryRestartTask == nil else { return }
         logger.info("Starting local discovery and listener")
@@ -199,6 +202,8 @@ final class NearLinkAppModel: ObservableObject {
         }
     }
 
+    // 先计算摘要并监听临时 TCP 端口，再通过 WebSocket 发 file_offer。
+    // 文件接收方随后主动连接这个端口；文件字节不放进 WebSocket JSON。
     func stageFile(_ fileURL: URL) {
         guard let selectedDeviceID else {
             appendMessage("Select a nearby device before offering a file.")
@@ -316,6 +321,7 @@ final class NearLinkAppModel: ObservableObject {
                 if let warning = try IncomingFilePolicy.checkCapacity(requiredBytes: requiredBytes, availableBytes: available, reservedBytes: reservedBytes) {
                     incomingStorageNotice = warning
                 }
+                // 在首次 await 前登记预算，避免任务挂起时其他接收重复占用同一份可用空间。
                 incomingStorageReservations[transferID] = requiredBytes
                 let reservationBytes = requiredBytes
                 guard let port = offer.descriptor.streamPort,
@@ -407,6 +413,7 @@ final class NearLinkAppModel: ObservableObject {
         }
     }
 
+    // 控制消息的统一分发入口。通用 ACK 仅确认控制帧，文件校验结果由 transfer_complete 表达。
     private func handleControlMessage(_ data: Data, from connection: WebSocketConnectionActor) {
         guard let header = try? JSONDecoder().decode(ControlMessageHeader.self, from: data), header.version == NearLinkProtocol.version else { return }
         logger.debug("Received control frame: \(header.type.rawValue, privacy: .public), id=\(header.messageID.uuidString, privacy: .public)")
@@ -438,8 +445,7 @@ final class NearLinkAppModel: ObservableObject {
                     transferPeerIDs[envelope.payload.transfer.id] = peerID
                     appendTransferItem(envelope.payload.transfer.id, peerID: peerID, isIncoming: true)
                 }
-                // The user already opened this device conversation, so accepting
-                // the offer immediately keeps the transfer inside the chat flow.
+                // 文件邀请自动进入大小、校验信息和存储空间检查；不要求用户先打开该会话。
                 acceptIncomingTransfer(envelope.payload.transfer.id)
             }
         case .fileAccept:
@@ -481,14 +487,22 @@ final class NearLinkAppModel: ObservableObject {
         case .hello:
             if let envelope = try? ProtocolCodec().decode(NearLinkEnvelope<HelloPayload>.self, from: data) {
                 let verifiedDevice = envelope.payload.device
-                connectionPeerIDs[ObjectIdentifier(connection)] = verifiedDevice.id
-                logger.debug("Mapped control connection to \(verifiedDevice.name, privacy: .public) / \(verifiedDevice.id.uuidString, privacy: .public)")
+                let connectionID = ObjectIdentifier(connection)
+                let expectedID = connectionPeerIDs[connectionID]
+                logger.debug("Received hello from \(verifiedDevice.name, privacy: .public) / \(verifiedDevice.id.uuidString, privacy: .public)")
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let discoveredID = await discovery.reconcileDeviceID(
-                        forServiceNamed: verifiedDevice.name,
+                        discoveredID: expectedID,
                         verifiedID: verifiedDevice.id
                     )
+                    if let expectedID, expectedID != verifiedDevice.id, discoveredID == nil {
+                        // A stable discovery identity cannot be replaced by hello.
+                        logger.error("Rejected hello conflicting with the connected peer identity")
+                        await connection.cancel()
+                        return
+                    }
+                    connectionPeerIDs[connectionID] = verifiedDevice.id
                     reconcileDeviceIdentity(
                         discoveredID: discoveredID,
                         verifiedDevice: verifiedDevice
@@ -561,8 +575,9 @@ final class NearLinkAppModel: ObservableObject {
     /// Without this migration, an incoming message can be stored under the
     /// hello ID while ConversationView filters on a temporary Bonjour UUID.
     func reconcileDeviceIdentity(discoveredID: UUID?, verifiedDevice: NearbyDevice) {
-        let fallbackID = nearbyDevices.first(where: { $0.name == verifiedDevice.name })?.id
-        let previousID = discoveredID ?? fallbackID
+        // discoveredID is supplied only after discovery validates its provenance.
+        // No name fallback: an inbound peer may share any other peer's name.
+        let previousID = discoveredID
 
         if let previousID, let index = nearbyDevices.firstIndex(where: { $0.id == previousID }) {
             let current = nearbyDevices[index]
@@ -667,6 +682,7 @@ final class NearLinkAppModel: ObservableObject {
     ) async throws {
         let messageID = envelope.messageID
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            // 先登记等待者再发送，避免快速返回的 ACK 找不到对应 continuation。
             pendingMessageAcknowledgements[messageID] = continuation
             Task { [weak self] in
                 do {
@@ -701,6 +717,7 @@ final class NearLinkAppModel: ObservableObject {
         }
     }
 
+    // 当前实际路径只缓存在内存中；重启后的同名查找不是可靠的文件身份匹配，仍需完善持久化。
     func fileURL(for transferID: UUID) -> URL? {
         if let url = transferFileURLs[transferID], FileManager.default.fileExists(atPath: url.path) {
             return url

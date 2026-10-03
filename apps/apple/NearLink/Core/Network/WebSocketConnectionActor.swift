@@ -102,6 +102,7 @@ actor WebSocketConnectionActor {
         }
     }
 
+    // contentProcessed 只表示本地网络栈处理了发送；等待对端 ACK 的逻辑在 AppModel。
     func send<Payload>(_ envelope: NearLinkEnvelope<Payload>) async throws where Payload: Codable & Sendable {
         guard currentState == .connected else { throw NearLinkError.connectionFailed("Not connected") }
         let metadata = NWProtocolWebSocket.Metadata(opcode: .text)

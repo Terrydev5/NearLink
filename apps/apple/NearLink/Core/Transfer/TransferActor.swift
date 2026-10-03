@@ -1,5 +1,7 @@
 import Foundation
 
+// 管理传输描述、状态迁移和终态历史；实际 TCP 收发位于 TCPFileTransfer.swift。
+// AppModel 把这里的快照发布给界面，进度字节数本身不等于对端已校验成功。
 actor TransferActor {
     private var transfers: [UUID: TransferSnapshot] = [:]
     private let historyKey = "NearLink.transferHistory.v1"

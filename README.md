@@ -1,13 +1,16 @@
 # NearLink
 
-NearLink is an experimental local-network file and message transfer application for Apple and Android devices. It has no account or cloud relay: nearby peers find one another with Bonjour / DNS-SD, use WebSocket for control messages, and use a temporary TCP stream for file data.
+NearLink is an experimental local-network file and message transfer application for iOS, macOS, Android, and Windows. It has no account or cloud relay: nearby peers find one another with Bonjour / DNS-SD, use WebSocket for control messages, and use a temporary TCP stream for file data.
 
 ## Current status
 
 - Apple: iPhone and macOS discovery, text messaging, sending files, and receiving files.
 - Android: Kotlin + Jetpack Compose client with discovery, text messaging, sending files, and receiving files.
+- Windows: .NET 10 + WinUI client source with discovery, messaging, file transfer, and local history. Portable core tests pass; native Windows build and device validation are still required.
 
-File transfers use SHA-256 verification and a short-lived, one-time token for the TCP stream. This reduces accidental or opportunistic use of the temporary file port, but it is not end-to-end encryption and does not authenticate a peer. Use the app only with peers and networks you trust.
+A four-platform review recorded 20 findings; its 3 P1 issues have been fixed and 17 P2 findings remain open. See the [protocol limitations](docs/protocol.md#implementation-limitations) for user-facing caveats.
+
+File transfers use SHA-256 verification and a short-lived token intended for one-time use on the TCP stream. This reduces accidental or opportunistic use of the temporary file port, but it is not end-to-end encryption and does not authenticate a peer. Use the app only with peers and networks you trust.
 
 ## Platform support
 
@@ -16,16 +19,20 @@ File transfers use SHA-256 verification and a short-lived, one-time token for th
 | iOS | SwiftUI | Experimental |
 | macOS | SwiftUI | Experimental |
 | Android | Kotlin + Jetpack Compose | Experimental |
+| Windows x64 | .NET 10 + WinUI | Experimental; native validation pending |
 
-Windows is not included in this release.
+Source availability does not imply a validated release package. See the [Windows build and usage guide](apps/windows/README.md).
 
 ## Repository layout
 
 ```text
 apps/apple/    iOS + macOS SwiftUI application
 apps/android/  Android Studio / Kotlin application
-docs/          public project and GitHub preparation notes
+apps/windows/  Windows WinUI application, portable core, tests, and publishing scripts
+docs/          protocol, privacy, development, and project notes
 ```
+
+For a guided tour, see the [code reading guide (中文)](docs/code-reading-guide.md), including the Apple/Android call chains and Windows entry points.
 
 ## Build and test
 
@@ -43,6 +50,10 @@ Open `apps/android` in Android Studio with Android SDK 35 and JDK 17. The debug 
 ./gradlew :app:assembleDebug
 ```
 
+Run `./gradlew :app:lintDebug` separately. The 2026-10-03 review originally found two Lint errors. The Android 12 permission declaration was subsequently fixed. The MediaStore API-level annotation still needs correction.
+
+For Windows, use .NET 10 and run `dotnet run --project Tests/NearLink.Core.Tests.csproj -c Release` from `apps/windows`. Build and publish the WinUI app on Windows using `./scripts/publish.ps1`; see the [Windows guide](apps/windows/README.md) for prerequisites and protocol-fixture checks. The repository includes a [Windows and Apple-contract CI workflow](.github/workflows/windows.yml); its presence is not evidence of a successful remote run.
+
 Test discovery, messaging, normal file transfer, rejected unauthenticated connections, expired transfer tokens, and received-file integrity on at least two physical devices connected to the same local network. Emulators and simulators are not a substitute for mDNS and peer-to-peer testing.
 
 All participants must run protocol version 2. Older builds are intentionally incompatible with v2 file offers.
@@ -51,13 +62,13 @@ All participants must run protocol version 2. Older builds are intentionally inc
 
 NearLink is an experimental local-network tool, not a secure messenger or a secure file vault. Control messages and file bytes are not yet encrypted, and devices are not yet paired or authenticated. Do not send private, confidential, or high-value data through NearLink.
 
-NearLink automatically checks incoming file offers on Apple and Android and receives those that pass validation and storage checks. Neither client asks for per-file approval. The discovery list and selected conversation are not access-control allowlists; use the app only on networks and with peers you trust.
+NearLink automatically checks incoming file offers on Apple, Android, and Windows and receives those that pass validation and storage checks. None of the clients asks for per-file approval. The discovery list and selected conversation are not access-control allowlists; use the app only on networks and with peers you trust.
 
 Each incoming file is limited to **2 GiB (2,147,483,648 bytes)**. Before accepting, the receiver checks free storage, reserves space for concurrent receives (at most ten), and keeps **512 MiB** free. It shows a notice if projected remaining space is below **2 GiB**, and rejects a file if space is insufficient. iOS also budgets for the extra Photos copy of received media. These checks use disk storage, not RAM.
 
-During reception, actual bytes may not exceed the advertised size; truncated streams and invalid SHA-256 digests fail. Free space is checked before each write. Apple and Android 8–9 use temporary files; newer Android uses pending MediaStore entries. Files become visible only after verification, and handled receive failures clean up their temporary data. Forced process termination and full interruption recovery are not covered by that guarantee.
+During reception, actual bytes may not exceed the advertised size; truncated streams and invalid SHA-256 digests fail. Free space is checked before each write. Apple, Windows, and Android 8–9 use temporary files; newer Android uses pending MediaStore entries. Files become visible only after verification, and handled receive failures clean up their temporary data. Forced process termination and full interruption recovery are not covered by that guarantee.
 
-Protocol version 2 adds a 256-bit, one-time token to every temporary file stream. The token expires after two minutes and prevents a client that lacks the offer from reading file bytes. It does not protect against an attacker who can observe or alter local-network traffic.
+Protocol version 2 adds a 256-bit token intended for one-time use to every temporary file stream. Its authorization window is two minutes. Android still needs atomic token consumption and a post-read expiry check. The token does not protect against an attacker who can observe or alter local-network traffic.
 
 ## Privacy
 
@@ -65,12 +76,13 @@ See [Privacy and security](docs/privacy.md) for the data stored locally, permiss
 
 ## Roadmap
 
-- Expand the existing ACK contract and transfer-safety tests into broader cross-platform protocol coverage, add continuous integration, and record reproducible real-device validation results.
-- Make sender completion depend on receiver confirmation, refresh Android connection endpoints after rediscovery, and persist the actual received-file location on Apple clients.
+- Extend the existing Windows/Apple-contract CI to Android checks and full Apple builds, and record reproducible real-device validation results across all four platforms.
+- Resolve the remaining platform-specific identity, IPv6, rediscovery, and transfer lifecycle issues.
+- Make Apple sender completion depend on receiver confirmation, refresh Android connection endpoints after rediscovery, and persist the actual received-file location on Apple clients.
 - Improve cancellation, resuming, and recovery after interrupted transfers.
 - Add verified device pairing, then encrypt and authenticate control and file transports before recommending NearLink for sensitive content.
 
-These roadmap items are not completed features. In particular, Android sender success can currently precede receiver verification, and token expiry does not guarantee complete transfer cleanup. See [protocol implementation limitations](docs/protocol.md#implementation-limitations).
+These roadmap items are not completed features. In particular, Android token expiry does not guarantee complete transfer cleanup. See [protocol implementation limitations](docs/protocol.md#implementation-limitations).
 
 ## Contributing
 

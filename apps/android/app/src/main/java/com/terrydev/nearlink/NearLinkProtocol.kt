@@ -33,7 +33,9 @@ fun historicalDevice(id: UUID): NearbyDevice = NearbyDevice(
     port = 0
 )
 
+// 与 Apple NearLinkEnvelope 对齐：字段名、协议版本和 Unix 毫秒时间戳都是线上契约。
 object Envelope {
+    // 参数是原消息 ID；ACK 自己生成新的外层 messageID，并在 payload 中关联原消息。
     fun acknowledgement(messageID: String): String = JSONObject()
         .put("version", NearLinkProtocol.VERSION)
         .put("type", "ack")

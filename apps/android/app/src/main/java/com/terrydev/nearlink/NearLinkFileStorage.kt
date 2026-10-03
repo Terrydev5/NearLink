@@ -76,6 +76,7 @@ class NearLinkFileStorage(context: Context) {
             val checksum = resolver.openOutputStream(uri)?.use { output ->
                 VerifiedFileCopy.copy(input, output, expectedBytes, expectedChecksum, ::availableBytes, onProgress)
             } ?: error("Could not open the media library destination")
+            // copy 已验证实际大小和 SHA-256，且输出已关闭，此时才将 pending 条目发布给用户。
             check(resolver.update(uri, ContentValues().apply {
                 put(MediaStore.MediaColumns.IS_PENDING, 0)
             }, null, null) == 1) { "Could not publish the verified file" }

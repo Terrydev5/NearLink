@@ -1,6 +1,6 @@
 # NearLink Protocol
 
-This document describes protocol version 2 as implemented by the Apple and Android clients. It is a working interoperability specification, not a guarantee of compatibility with older builds.
+This document describes protocol version 2 used by the Apple, Android, and Windows clients. It is a working interoperability specification, not a guarantee of compatibility with older builds. Implementation differences and limitations are documented below.
 
 ## Transport and discovery
 
@@ -25,7 +25,7 @@ Every WebSocket message is UTF-8 JSON with this shape. `timestamp` is Unix time 
 }
 ```
 
-The protocol defines `hello`, `text_message`, `file_offer`, `file_accept`, `file_reject`, `transfer_start`, `transfer_progress`, `transfer_complete`, `transfer_cancel`, `heartbeat`, `heartbeat_ack`, `ack`, and `error`. A defined message type does not imply that both clients implement its full lifecycle; see the implementation limitations below.
+The protocol defines `hello`, `text_message`, `file_offer`, `file_accept`, `file_reject`, `transfer_start`, `transfer_progress`, `transfer_complete`, `transfer_cancel`, `heartbeat`, `heartbeat_ack`, `ack`, and `error`. A defined message type does not imply that every client implements its full lifecycle; see the implementation limitations below.
 
 `hello.payload.device` includes `id`, `name`, `platform`, and `protocolVersion`. A text message uses `payload.text` and may include `payload.senderID` so a receiver can identify its peer while the initial hello frame is still being handled.
 
@@ -33,25 +33,29 @@ The protocol defines `hello`, `text_message`, `file_offer`, `file_accept`, `file
 
 1. The sender calculates the file's SHA-256 digest, opens a temporary TCP listener, generates a random one-time token, and sends `file_offer`.
 2. `file_offer.payload.transfer` contains `id`, `fileName`, `fileSize`, `checksum`, optional `mimeType`, `streamPort`, `streamToken`, and `streamTokenExpiresAt`.
-3. Both clients automatically evaluate offers; they do not prompt for per-file approval. The receiver accepts with `file_accept` after validation and storage checks, or uses `file_reject` for handled rejections. Both messages carry `transferID` and `receivedBytes`. Malformed or undecodable offers can be dropped before this decision path.
+3. All three client implementations automatically evaluate offers; they do not prompt for per-file approval. The receiver accepts with `file_accept` after validation and storage checks, or uses `file_reject` for handled rejections. Both messages carry `transferID` and `receivedBytes`. Malformed or undecodable offers can be dropped before this decision path.
 4. Before the receiver reads file bytes from the TCP connection, it sends the ASCII stream token followed by a newline (`\n`). This authorizes the data connection with a bearer token; it does not verify the peer's identity.
 5. The receiver writes the stream in chunks of up to 256 KiB, verifies its exact byte count and SHA-256 digest, and only then publishes the file. A successful receiver attempts to send `transfer_complete` over the control connection.
 
-Both clients reject incoming offers with negative sizes or sizes above 2 GiB (2,147,483,648 bytes), malformed SHA-256 digests, insufficient free storage, or more than ten concurrent receives. Admission accounts for other active receives and a 512 MiB free-space reserve. A receiver warns locally when projected remaining storage is below 2 GiB. iOS also reserves room for an automatic Photos copy where applicable.
+All three implementations reject incoming offers with negative sizes or sizes above 2 GiB (2,147,483,648 bytes), malformed SHA-256 digests, insufficient free storage, or more than ten concurrent receives. Admission accounts for other active receives and a 512 MiB free-space reserve. A receiver warns locally when projected remaining storage is below 2 GiB. iOS also reserves room for an automatic Photos copy where applicable.
 
 The data stream must contain exactly `fileSize` bytes. Receivers reject excess bytes before writing them, reject premature EOF, and verify the digest before publishing the file. Handled failures remove partial files/pending media and attempt to send `file_reject` when the control connection is available. This cleanup is not a guarantee of recovery after forced process termination. Receive limits are local policy and do not change protocol version 2.
 
 ACK frames use the complete control envelope, including a fresh `messageID` and millisecond `timestamp`. `payload.messageID` identifies the acknowledged message.
 
-Tokens are URL-safe, 256-bit random values and expire after two minutes in the current implementation. They authenticate the temporary data connection; they do **not** encrypt control messages or file contents.
+Tokens are URL-safe, 256-bit random values with a two-minute authorization window by default. They authorize the temporary data connection; they do **not** encrypt control messages or file contents. One-time consumption is the intended contract; Android prevents a duplicate accept from starting a second sender task, but still lacks a post-token-read expiry check and atomic one-time token consumption.
 
 ## Implementation limitations
 
 - `file_accept` reflects an automatic receiver decision, not explicit user approval. A low-storage alert is informational and does not serve as approval.
-- `transfer_complete` is the receiver's completion signal, but the Android sender currently also marks a transfer complete when its local socket write finishes. Its displayed success does not yet guarantee that the receiver verified and saved the file. On iOS, the completion signal currently follows the optional Photos-saving step, which can delay the receipt.
-- `transfer_cancel` exists in the protocol, but cancellation does not yet consistently stop established data sockets and all related tasks. Two-minute token expiry does not imply a transfer-wide timeout or complete resource cleanup; in particular, an unanswered Android file offer can retain its listener.
+- `transfer_complete` is the receiver's completion signal. The Android sender marks success only after the local byte stream finishes and a matching peer receipt reports the expected byte count; it waits up to 60 seconds, then keeps an `UNCONFIRMED` state. A receipt arriving after that timeout is ignored. On iOS, the completion signal currently follows the optional Photos-saving step, which can delay the receipt.
+- Windows waits for a matching completion receipt with the expected byte count. Its default receipt timeout is 60 seconds; missing confirmation produces `Unconfirmed`, and a matching late receipt can update that record to `Completed`.
+- Apple/Android still need transfer-decision checks for peer ownership, direction and allowed state; their completion handlers do not enforce the same byte-count contract as Windows.
+- `transfer_cancel` exists in the protocol, but Apple/Android cancellation does not yet consistently stop established data sockets and all related tasks. Two-minute token expiry does not imply a transfer-wide timeout or complete resource cleanup; in particular, an unanswered Android file offer can retain its listener. Windows has separate offer, authentication, connection, idle and receipt deadlines and closes active sockets on cancellation.
+- Apple and Windows wait for an ACK when sending text. Android currently records outbound text after local WebSocket queueing, without waiting for an ACK. The Android server sends generic ACKs, but its outbound WebSocket callback only handles heartbeat replies and does not provide a symmetric generic-ACK path.
+- Android currently processes file offers on its accepted server connection. Apple and Windows initiate their own outbound control connection when sending a file; sending an offer back over an Android-initiated connection is not supported by the Android handler.
 - Interrupted-transfer recovery and byte-range resumption are not implemented. The current transfer flow starts at byte zero; `receivedBytes` in decision messages is not evidence of resumable transfer support.
 
 ## Compatibility and change policy
 
-Any incompatible wire-format change must increase `version`. Additive optional fields may remain within a protocol version only when both clients safely ignore fields they do not know. Update this document and add cross-platform test vectors before changing the wire format.
+Any incompatible wire-format change must increase `version`. Additive optional fields may remain within a protocol version only when all clients safely ignore fields they do not know. Update this document and add cross-platform test vectors before changing the wire format. Current fixture checks cover Apple/Android/Windows encoding compatibility; they do not replace native real-device network tests.

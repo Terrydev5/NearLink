@@ -1,0 +1,46 @@
+name: Windows client
+on:
+  push:
+    paths: ['apps/windows/**', 'apps/apple/NearLink/Core/Protocol/**', '.github/workflows/windows.yml']
+  pull_request:
+    paths: ['apps/windows/**', 'apps/apple/NearLink/Core/Protocol/**', '.github/workflows/windows.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Core protocol and loopback network tests
+        run: dotnet run --project Tests/NearLink.Core.Tests.csproj -c Release
+      - name: Publish Windows x64 client
+        shell: pwsh
+        run: ./scripts/publish.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NearLink-Windows-x64
+          path: apps/windows/artifacts/win-x64/
+          if-no-files-found: error
+  apple-contract:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: apps/windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Export Windows production fixtures
+        run: dotnet run --project Tests/NearLink.Core.Tests.csproj -c Release -- --export-fixtures "$RUNNER_TEMP/windows-fixtures.json"
+      - name: Decode with Apple production codec and export Apple fixtures
+        run: zsh scripts/test-apple-interop.sh "$RUNNER_TEMP/windows-fixtures.json" "$RUNNER_TEMP/apple-fixtures.json"
+      - name: Decode Apple production fixtures
+        run: dotnet run --project Tests/NearLink.Core.Tests.csproj -c Release -- --control-fixtures "$RUNNER_TEMP/apple-fixtures.json"

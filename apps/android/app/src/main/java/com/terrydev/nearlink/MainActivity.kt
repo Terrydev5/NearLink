@@ -1,6 +1,5 @@
 package com.terrydev.nearlink
 
-import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -98,12 +97,19 @@ private val NearLinkBackground = Color(0xFFF6F7FB)
 private val NearLinkSecondaryText = Color(0xFF737985)
 
 class MainActivity : ComponentActivity() {
+    // Activity 提供权限、文件选择器和 Compose 入口；业务状态由 ViewModel 持有。
     private val model by viewModels<NearLinkViewModel>()
     private val nearbyPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        val granted = hasNearbyPermission()
         NearLinkDiagnostics.event("Nearby-device permission result: granted=$granted")
-        if (granted) model.start()
+        if (granted) {
+            model.start()
+        } else {
+            model.discoveryStatus.value = "Permission denied. Enable nearby access in system settings, then reopen NearLink."
+            Toast.makeText(this, "Nearby access was not granted", Toast.LENGTH_LONG).show()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -143,18 +149,17 @@ class MainActivity : ComponentActivity() {
         requestNearbyPermissionIfNeeded()
     }
 
+    private fun hasNearbyPermission(): Boolean = NearbyPermissionPolicy.canStart(Build.VERSION.SDK_INT) {
+        checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+    }
+
     private fun requestNearbyPermissionIfNeeded() {
-        val permission = if (Build.VERSION.SDK_INT >= 33) {
-            Manifest.permission.NEARBY_WIFI_DEVICES
-        } else {
-            Manifest.permission.ACCESS_FINE_LOCATION
-        }
-        if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
-            NearLinkDiagnostics.event("Requesting nearby-device permission: $permission")
-            nearbyPermissionLauncher.launch(permission)
-        } else {
-            NearLinkDiagnostics.event("Nearby-device permission already granted: $permission")
+        if (hasNearbyPermission()) {
             model.start()
+        } else {
+            val permissions = NearbyPermissionPolicy.requestedPermissions(Build.VERSION.SDK_INT)
+            NearLinkDiagnostics.event("Requesting nearby-device permissions: ${permissions.joinToString()}")
+            nearbyPermissionLauncher.launch(permissions)
         }
     }
 }
@@ -672,6 +677,8 @@ private fun transferStatusTitle(transfer: TransferItem): String = when (transfer
     TransferStatus.WAITING -> if (transfer.incoming) "Accept?" else "Waiting…"
     TransferStatus.SENDING -> "Sending…"
     TransferStatus.RECEIVING -> "Receiving…"
+    TransferStatus.AWAITING_CONFIRMATION -> "Verifying…"
+    TransferStatus.UNCONFIRMED -> "Sent; not confirmed"
     TransferStatus.COMPLETED -> if (transfer.incoming) "Saved" else "Completed"
     TransferStatus.FAILED -> "Failed"
     TransferStatus.CANCELLED -> "Cancelled"
@@ -681,7 +688,8 @@ private fun transferStatusColor(transfer: TransferItem): Color = when (transfer.
     TransferStatus.COMPLETED -> Color(0xFF2DBE60)
     TransferStatus.FAILED -> Color(0xFFE5484D)
     TransferStatus.CANCELLED -> NearLinkSecondaryText
-    TransferStatus.SENDING, TransferStatus.RECEIVING -> NearLinkBlue
+    TransferStatus.SENDING, TransferStatus.RECEIVING, TransferStatus.AWAITING_CONFIRMATION -> NearLinkBlue
+    TransferStatus.UNCONFIRMED -> Color(0xFFE6A700)
     TransferStatus.WAITING -> NearLinkSecondaryText
 }
 

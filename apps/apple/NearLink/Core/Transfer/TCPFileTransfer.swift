@@ -60,6 +60,7 @@ actor OutboundFileServer {
         }
     }
 
+    // 当前只关闭监听器；已经建立的数据连接由 stream(to:) 持有，完整取消仍需后续完善。
     func stop() {
         listener?.cancel()
         listener = nil
@@ -133,6 +134,7 @@ actor InboundFileReceiver {
         try await send(Data((streamToken + "\n").utf8), on: connection, isComplete: false)
         let writer = try VerifiedIncomingFile(destination: destinationURL, expectedBytes: expectedBytes,
                                               expectedChecksum: expectedChecksum)
+        // 失败时清理临时文件；finish 校验并发布后，discard 不会删除已提交的最终文件。
         defer { writer.discard() }
 
         while true {
@@ -142,6 +144,7 @@ actor InboundFileReceiver {
                 try writer.append(data)
                 progressHandler(writer.completedBytes)
             }
+            // TCP 结束不代表成功：finish 还会检查精确字节数和 SHA-256，再发布文件。
             if received.isComplete { return try writer.finish() }
         }
     }

@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.flow.collect
 import org.json.JSONObject
 
+// 每台 Android 同时是 WebSocket 客户端和服务端；这里接收对端主动建立的控制连接。
 class NearLinkServer(
     private val messageHandler: suspend (raw: String, send: suspend (String) -> Unit, remoteHost: String) -> Unit
 ) {

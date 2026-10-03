@@ -10,8 +10,7 @@ actor BonjourDiscoveryActor {
     private var listener: NWListener?
     private var continuation: AsyncStream<[NearbyDevice]>.Continuation?
     private var incomingConnectionContinuation: AsyncStream<NWConnection>.Continuation?
-    private var knownDeviceIDs: [String: UUID] = [:]
-    private var endpoints: [UUID: NWEndpoint] = [:]
+    private var identities = BonjourIdentityCache()
     private let logger = Logger(subsystem: "cn.terrydev.NearLink", category: "bonjour")
 
     init(localDevice: NearbyDevice) {
@@ -42,7 +41,7 @@ actor BonjourDiscoveryActor {
         continuation = nil
         incomingConnectionContinuation?.finish()
         incomingConnectionContinuation = nil
-        endpoints.removeAll()
+        identities.clearEndpoints()
     }
 
     /// Restart without finishing the async streams owned by the app model.
@@ -53,7 +52,7 @@ actor BonjourDiscoveryActor {
         listener?.cancel()
         browser = nil
         listener = nil
-        endpoints.removeAll()
+        identities.clearEndpoints()
         startIfNeeded()
     }
 
@@ -96,7 +95,7 @@ actor BonjourDiscoveryActor {
 
     private func publish(_ results: Set<NWBrowser.Result>) {
         // A device that disappeared must no longer have a routable cached endpoint.
-        endpoints.removeAll()
+        identities.clearEndpoints()
         let devices = results.compactMap { result -> NearbyDevice? in
             guard case let .service(name, _, _, _) = result.endpoint else { return nil }
             let record: [String: String]
@@ -107,7 +106,7 @@ actor BonjourDiscoveryActor {
             }
             // Prefer persistent identity over names, which may be shared by peers.
             if record["deviceId"] == nil, name == localDevice.name { return nil }
-            let id = UUID(uuidString: record["deviceId"] ?? "") ?? knownDeviceIDs[name] ?? UUID()
+            let id = identities.register(endpoint: result.endpoint, advertisedID: UUID(uuidString: record["deviceId"] ?? ""))
             guard id != localDevice.id else { return nil }
             // Some Network.framework browse results omit TXT records even when the
             // service advertises one. Keep the device visible and verify it with hello.
@@ -115,8 +114,6 @@ actor BonjourDiscoveryActor {
             let platform = DevicePlatform(rawValue: platformValue) ?? .iOS
             let protocolVersion = Int(record["protocolVersion"] ?? "") ?? NearLinkProtocol.version
             guard protocolVersion == NearLinkProtocol.version else { return nil }
-            knownDeviceIDs[name] = id
-            endpoints[id] = result.endpoint
             return NearbyDevice(
                 id: id,
                 name: name,
@@ -140,23 +137,13 @@ actor BonjourDiscoveryActor {
     }
 
     func endpoint(for deviceID: UUID) -> NWEndpoint? {
-        endpoints[deviceID]
+        identities.endpoint(for: deviceID)
     }
 
-    /// Bonjour occasionally omits TXT metadata from a browse result. In that
-    /// case the browser temporarily keys a peer by a generated UUID; `hello`
-    /// later supplies the peer's persistent ID. Move the endpoint cache to the
-    /// verified identity so connection lookup and the UI use the same key.
-    func reconcileDeviceID(forServiceNamed serviceName: String, verifiedID: UUID) -> UUID? {
-        let discoveredID = knownDeviceIDs[serviceName]
-        knownDeviceIDs[serviceName] = verifiedID
-
-        guard let discoveredID, discoveredID != verifiedID else { return discoveredID }
-        if let endpoint = endpoints.removeValue(forKey: discoveredID) {
-            endpoints[verifiedID] = endpoint
-        }
-        logger.debug("Reconciled Bonjour identity for \(serviceName, privacy: .public): \(discoveredID.uuidString, privacy: .public) → \(verifiedID.uuidString, privacy: .public)")
-        return discoveredID
+    /// Only the provisional ID of this outbound connection may be migrated.
+    /// An inbound hello has no discovery identity and must never match by name.
+    func reconcileDeviceID(discoveredID: UUID?, verifiedID: UUID) -> UUID? {
+        identities.reconcile(discoveredID: discoveredID, verifiedID: verifiedID)
     }
 
     private func publishIncoming(_ connection: NWConnection) {
@@ -173,5 +160,46 @@ actor BonjourDiscoveryActor {
         parameters.includePeerToPeer = true
         parameters.defaultProtocolStack.applicationProtocols.insert(NWProtocolWebSocket.Options(), at: 0)
         return parameters
+    }
+}
+
+/// Discovery provenance is indexed by the complete service endpoint (including
+/// domain and interface), never by the peer's freely chosen display name.
+nonisolated struct BonjourIdentityCache {
+    private var serviceIDs: [NWEndpoint: UUID] = [:]
+    private var endpoints: [UUID: NWEndpoint] = [:]
+    private var provisionalIDs: Set<UUID> = []
+
+    mutating func register(endpoint: NWEndpoint, advertisedID: UUID?) -> UUID {
+        let id: UUID
+        if let advertisedID {
+            id = advertisedID
+            provisionalIDs.remove(id)
+        } else if let existing = serviceIDs[endpoint] {
+            id = existing
+        } else {
+            id = UUID()
+            provisionalIDs.insert(id)
+        }
+        serviceIDs[endpoint] = id
+        endpoints[id] = endpoint
+        return id
+    }
+
+    func endpoint(for id: UUID) -> NWEndpoint? { endpoints[id] }
+    mutating func clearEndpoints() { endpoints.removeAll() }
+
+    mutating func reconcile(discoveredID: UUID?, verifiedID: UUID) -> UUID? {
+        guard let discoveredID else { return nil }
+        if discoveredID == verifiedID { return discoveredID }
+        guard provisionalIDs.remove(discoveredID) != nil else { return nil }
+        let matchingEndpoints = serviceIDs.compactMap { $0.value == discoveredID ? $0.key : nil }
+        for endpoint in matchingEndpoints {
+            serviceIDs[endpoint] = verifiedID
+        }
+        if let endpoint = endpoints.removeValue(forKey: discoveredID) {
+            endpoints[verifiedID] = endpoint
+        }
+        return discoveredID
     }
 }

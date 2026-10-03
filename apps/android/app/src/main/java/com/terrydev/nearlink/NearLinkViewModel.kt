@@ -39,6 +39,8 @@ private fun persistentDeviceID(app: Application): UUID {
     return UUID.randomUUID().also { preferences.edit().putString(key, it.toString()).apply() }
 }
 
+// 业务编排入口：Compose 读取这里的状态，用户操作和网络事件也在这里汇合。
+// 阅读时跟踪 Main/IO 切换；协程不会自动让所有共享 Map 具有线程安全性。
 class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     val devices = mutableStateListOf<NearbyDevice>()
     val onlineDeviceIDs = mutableStateMapOf<UUID, Boolean>()
@@ -104,6 +106,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         NearLinkDiagnostics.event("NSD start returned")
     }
 
+    // URI 通过 ContentResolver 读取，不能直接当作本地路径。
+    // 准备阶段计算实际大小/摘要并监听临时 TCP 端口，file_offer 仅通过 WebSocket 发送元信息。
     fun stageFile(uri: Uri) {
         val target = selectedDevice.value ?: run {
             appendSystemMessage("Select a nearby device before choosing a file")
@@ -134,7 +138,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
                 synchronized(outgoingTransfers) {
                     outgoingTransfers[transferID!!] = OutgoingTransfer(
                         transferID!!, uri, metadata.name, metadata.size, checksum, metadata.mimeType,
-                        streamToken, streamTokenExpiresAt, socket
+                        streamToken, streamTokenExpiresAt, socket,
+                        OutgoingTransferConfirmation(target.id, metadata.size)
                     )
                 }
                 withContext(Dispatchers.Main) {
@@ -226,6 +231,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         return digest.digest().joinToString("") { "%02x".format(it) } to byteCount
     }
 
+    // 两个入口共用此分发器：Transport 主动连接的回调，以及 Server 接受连接后的回调。
+    // sendControl 是 Server 在原连接上回复的函数；主动连接回调用 transportPeerID 标识对端。
     private fun handleControlMessage(
         raw: String,
         sendControl: (suspend (String) -> Unit)?,
@@ -256,17 +263,24 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
             }
             "transfer_complete" -> {
                 val transferID = transferIDFromPayload(raw) ?: return
-                viewModelScope.launch(Dispatchers.Main) {
-                    transfers[transferID]?.let { current ->
-                        upsertTransfer(current.copy(completedBytes = current.fileSize, status = TransferStatus.COMPLETED))
-                        persistConversationHistory()
-                    }
-                }
+                val receivedBytes = runCatching {
+                    JSONObject(raw).getJSONObject("payload").getLong("receivedBytes")
+                }.getOrNull() ?: return
+                val peerID = transportPeerID ?: sessionPeerIDs[remoteHost] ?: return
+                val outgoing = synchronized(outgoingTransfers) { outgoingTransfers[transferID] } ?: return
+                if (outgoing.confirmation.confirm(peerID, receivedBytes)) refreshOutgoingTransfer(outgoing)
             }
             "file_reject", "transfer_cancel" -> {
                 val transferID = transferIDFromPayload(raw) ?: return
-                markTransferCancelled(transferID)
-                synchronized(outgoingTransfers) { outgoingTransfers.remove(transferID) }?.server?.close()
+                val peerID = transportPeerID ?: sessionPeerIDs[remoteHost] ?: return
+                val outgoing = synchronized(outgoingTransfers) { outgoingTransfers[transferID] }
+                if (outgoing != null) {
+                    outgoing.confirmation.cancel(peerID)
+                    refreshOutgoingTransfer(outgoing)
+                    runCatching { outgoing.server.close() }
+                } else {
+                    markTransferCancelled(transferID)
+                }
             }
             "hello" -> {
                 val peer = parseHelloDevice(raw) ?: return
@@ -322,6 +336,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         updateTransferProgress(transferID, 0, TransferStatus.RECEIVING)
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                // 准入检查和预算登记在同一段主线程代码中完成，随后回到 IO 协程接收文件。
                 withContext(Dispatchers.Main) {
                     IncomingFilePolicy.validateOffer(incoming.transfer.fileSize, incoming.transfer.checksum)
                     check(incomingStorageReservations.size < IncomingFilePolicy.MAXIMUM_CONCURRENT_RECEIVES) {
@@ -395,7 +410,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun startOutgoing(transferID: UUID) {
         val outgoing = synchronized(outgoingTransfers) { outgoingTransfers[transferID] } ?: return
-        updateTransferProgress(transferID, 0, TransferStatus.SENDING)
+        if (!outgoing.confirmation.start()) return
+        refreshOutgoingTransfer(outgoing)
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 acceptAuthorizedClient(outgoing).use { socket ->
@@ -409,14 +425,20 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
                             if (count <= 0) break
                             output.write(buffer, 0, count)
                             completed += count
-                            updateTransferProgress(transferID, completed, TransferStatus.SENDING)
+                            outgoing.confirmation.progress(completed)
+                            refreshOutgoingTransfer(outgoing)
                         }
                         output.flush()
+                        if (completed != outgoing.fileSize) throw IOException("Selected file changed while sending")
                     }
                 }
-                markTransferCompleted(transferID)
+                outgoing.confirmation.finishSending(outgoing.fileSize)
+                refreshOutgoingTransfer(outgoing)
+                outgoing.confirmation.awaitReceipt(OutgoingTransferConfirmation.receiptTimeoutMillis())
+                refreshOutgoingTransfer(outgoing)
             } catch (error: Exception) {
-                markTransferFailed(transferID, error.localizedMessage ?: "unknown error")
+                outgoing.confirmation.fail(error.localizedMessage ?: "unknown error")
+                refreshOutgoingTransfer(outgoing)
             } finally {
                 runCatching { outgoing.server.close() }
                 synchronized(outgoingTransfers) { outgoingTransfers.remove(transferID) }
@@ -434,6 +456,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         }
         draft.value = ""
         rememberDevice(target)
+        // sendText 返回表示本地入队成功；当前 Android 文字发送未像 Apple 一样等待协议 ACK。
         runCatching { transport.sendText(target, text) }
             .onSuccess { appendMessage(text, peerID = target.id, outgoing = true) }
             .onFailure { appendSystemMessage("Message failed: ${it.localizedMessage ?: "unknown error"}") }
@@ -569,11 +592,20 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun markTransferCompleted(transferID: UUID) {
+    private fun refreshOutgoingTransfer(outgoing: OutgoingTransfer) {
         viewModelScope.launch(Dispatchers.Main) {
-            transfers[transferID]?.let { current ->
-                upsertTransfer(current.copy(completedBytes = current.fileSize, status = TransferStatus.COMPLETED))
-                persistConversationHistory()
+            val snapshot = outgoing.confirmation.snapshot()
+            transfers[outgoing.id]?.let { current ->
+                if (current.incoming) return@let
+                if (current.status in setOf(TransferStatus.COMPLETED, TransferStatus.FAILED,
+                        TransferStatus.CANCELLED, TransferStatus.UNCONFIRMED)) return@let
+                upsertTransfer(current.copy(
+                    completedBytes = snapshot.completedBytes,
+                    status = snapshot.status,
+                    error = snapshot.error
+                ))
+                if (snapshot.status in setOf(TransferStatus.COMPLETED, TransferStatus.UNCONFIRMED,
+                        TransferStatus.FAILED, TransferStatus.CANCELLED)) persistConversationHistory()
             }
         }
     }
@@ -581,6 +613,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     private fun markTransferFailed(transferID: UUID, reason: String) {
         viewModelScope.launch(Dispatchers.Main) {
             transfers[transferID]?.let { current ->
+                if (current.status in setOf(TransferStatus.COMPLETED, TransferStatus.CANCELLED,
+                        TransferStatus.UNCONFIRMED)) return@let
                 upsertTransfer(current.copy(status = TransferStatus.FAILED, error = reason))
                 current.peerID?.let { peerID ->
                     timeline.add(ConversationItem.Message(UUID.randomUUID(), peerID, "File transfer failed: $reason", false, true))
@@ -593,6 +627,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
     private fun markTransferCancelled(transferID: UUID) {
         viewModelScope.launch(Dispatchers.Main) {
             transfers[transferID]?.let { current ->
+                if (current.status in setOf(TransferStatus.COMPLETED, TransferStatus.FAILED,
+                        TransferStatus.CANCELLED, TransferStatus.UNCONFIRMED)) return@let
                 upsertTransfer(current.copy(status = TransferStatus.CANCELLED))
                 persistConversationHistory()
             }
@@ -736,7 +772,8 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
             val restored = if (transfer.status in setOf(
                     TransferStatus.WAITING,
                     TransferStatus.SENDING,
-                    TransferStatus.RECEIVING
+                    TransferStatus.RECEIVING,
+                    TransferStatus.AWAITING_CONFIRMATION
                 )
             ) {
                 interruptedTransferCount += 1
@@ -827,7 +864,7 @@ class NearLinkViewModel(app: Application) : AndroidViewModel(app) {
 
 private data class FileMetadata(val name: String, val size: Long, val mimeType: String?)
 
-private data class OutgoingTransfer(
+internal data class OutgoingTransfer(
     val id: UUID,
     val uri: Uri,
     val fileName: String,
@@ -836,7 +873,8 @@ private data class OutgoingTransfer(
     val mimeType: String?,
     val streamToken: String,
     val streamTokenExpiresAt: Long,
-    val server: ServerSocket
+    val server: ServerSocket,
+    val confirmation: OutgoingTransferConfirmation
 )
 
 private data class TransferOffer(
@@ -862,7 +900,9 @@ enum class TransferStatus {
     RECEIVING,
     COMPLETED,
     FAILED,
-    CANCELLED
+    CANCELLED,
+    AWAITING_CONFIRMATION,
+    UNCONFIRMED
 }
 
 data class TransferItem(

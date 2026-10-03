@@ -23,6 +23,7 @@ nonisolated enum NearLinkMessageType: String, Codable, Sendable {
     case error
 }
 
+// 两端共用的 JSON 外层契约；timestamp 由 ProtocolCodec 编解码为 Unix 毫秒。
 nonisolated struct NearLinkEnvelope<Payload: Codable & Sendable>: Codable, Sendable {
     let version: Int
     let type: NearLinkMessageType
@@ -72,6 +73,7 @@ nonisolated struct TransferProgressPayload: Codable, Sendable {
 }
 
 nonisolated struct AckPayload: Codable, Sendable {
+    // 指向被确认消息的 ID；ACK 自己的 envelope.messageID 是另一个新 ID。
     let messageID: UUID
 }
 
